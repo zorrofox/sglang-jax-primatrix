@@ -870,7 +870,11 @@ class DeepseekV4Attention(nnx.Module):
         The forward used to dequantise (scale broadcast + multiply) and regroup wo_a on
         every step; at bs=1 that was ~0.9 ms per decode step across the layers.
         """
-        from sgl_jax.srt.layers.attention.dsv4.o_projection import group_wo_a
+        from sgl_jax.srt.layers.attention.dsv4.o_projection import (
+            fuse_wo_a_weights,
+            group_wo_a,
+            use_fused_wo_a,
+        )
 
         with jax.set_mesh(self.mesh):
             weights = group_wo_a(
@@ -878,6 +882,10 @@ class DeepseekV4Attention(nnx.Module):
                 num_groups=self.num_groups,
                 out_sharding=NamedSharding(self.mesh, P("tensor", None, None)),
             )
+            if use_fused_wo_a():
+                # The fused kernel wants [8*head_dim, G*R]; keep only that copy.
+                self.wo_a_fused = nnx.Param(fuse_wo_a_weights(weights, mesh=self.mesh))
+                return
         self.wo_a_grouped = nnx.Param(weights)
 
     def __call__(self, hidden, batch, pools, rope_cache, rope_halves=None):
@@ -931,6 +939,22 @@ class DeepseekV4Attention(nnx.Module):
             norm_eps=self.norm_eps,
             index_topk=self.index_topk,
         )
+        if getattr(self, "wo_a_fused", None) is not None:
+            from sgl_jax.srt.layers.attention.dsv4.o_projection import (
+                fused_wo_a_projection,
+            )
+
+            reduced = fused_wo_a_projection(
+                output,
+                cos,
+                sin,
+                self.wo_a_fused.value,
+                mesh=self.mesh,
+                rope_head_dim=self.rope_head_dim,
+                dtype=self.dtype,
+            )
+            output, _ = self.wo_b(reduced)
+            return output, updates
         output = apply_dsv4_partial_rope(
             output, cos[:, None, :], sin[:, None, :], rope_head_dim=self.rope_head_dim, inverse=True
         )

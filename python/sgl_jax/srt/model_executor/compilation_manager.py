@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -64,9 +65,30 @@ class CompilationManager:
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
+        # Optional context-length ladder (SGLANG_JAX_PRECOMPILE_CONTEXT_LADDER, comma
+        # separated tokens). Backends whose compiled shapes depend on the history length
+        # (DeepSeek-V4 read-table capacity buckets) get one precompile pass per rung;
+        # other backends ignore it. [None] keeps the stock single pass.
+        self.context_ladder = self._compute_context_ladder()
         self.cache_loc_buckets = self._compute_cache_loc_buckets()
         self._compiled_variants: set[tuple] = set()
         self._compiled_multimodal_extend_shapes: set[tuple[int, int]] = set()
+
+    @staticmethod
+    def _compute_context_ladder() -> list[int | None]:
+        raw = os.environ.get("SGLANG_JAX_PRECOMPILE_CONTEXT_LADDER", "").strip()
+        if not raw:
+            return [None]
+        rungs = sorted({int(x) for x in raw.split(",") if x.strip()})
+        if any(r <= 0 for r in rungs):
+            raise ValueError("SGLANG_JAX_PRECOMPILE_CONTEXT_LADDER entries must be positive")
+        return list(rungs)
+
+    @staticmethod
+    def _set_precompile_context(model_runner, context_len: int | None) -> None:
+        backend = getattr(model_runner, "attn_backend", None)
+        if backend is not None and hasattr(backend, "precompile_context_len"):
+            backend.precompile_context_len = context_len
 
     def _compute_token_buckets(self, user_paddings: list[int] | None) -> list[int]:
         dp_size = self.dp_size
@@ -174,11 +196,16 @@ class CompilationManager:
             self.precompile_in_model_multimodal,
         )
 
-        pairs = list(itertools.product(multimodal_options, [bs], self.token_buckets))
+        pairs = list(
+            itertools.product(self.context_ladder, multimodal_options, [bs], self.token_buckets)
+        )
         with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
-                use_multimodal_input, bs_val, num_tokens = pair
-                pbar.set_postfix(multimodal=use_multimodal_input, bs=bs_val, tokens=num_tokens)
+                context_len, use_multimodal_input, bs_val, num_tokens = pair
+                self._set_precompile_context(model_runner, context_len)
+                pbar.set_postfix(
+                    ctx=context_len, multimodal=use_multimodal_input, bs=bs_val, tokens=num_tokens
+                )
                 if bs_val > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs_val, num_tokens)
                     continue
@@ -229,6 +256,7 @@ class CompilationManager:
                     self._compiled_multimodal_extend_shapes.add((num_tokens, bs_val))
 
         end_time = time.perf_counter()
+        self._set_precompile_context(model_runner, None)
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
 
     def _precompile_decode(
@@ -249,14 +277,11 @@ class CompilationManager:
             self.bs_buckets,
         )
 
-        with tqdm(
-            enumerate(self.bs_buckets),
-            desc="[DECODE] PRECOMPILE",
-            leave=False,
-            total=len(self.bs_buckets),
-        ) as pbar:
-            for i, bs_val in pbar:
-                pbar.set_postfix(bs=bs_val)
+        items = list(itertools.product(self.context_ladder, enumerate(self.bs_buckets)))
+        with tqdm(items, desc="[DECODE] PRECOMPILE", leave=False, total=len(items)) as pbar:
+            for context_len, (i, bs_val) in pbar:
+                self._set_precompile_context(model_runner, context_len)
+                pbar.set_postfix(ctx=context_len, bs=bs_val)
                 aligned_cache_loc_size = self.cache_loc_buckets[i]
                 batch = self._make_dummy_batch(
                     bs_val,
@@ -303,6 +328,7 @@ class CompilationManager:
                 self._compiled_variants.add((ForwardMode.DECODE, bs_val, bs_val, False))
 
         end_time = time.perf_counter()
+        self._set_precompile_context(model_runner, None)
         logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
     # ---- Dummy batch construction ----

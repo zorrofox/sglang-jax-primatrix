@@ -38,8 +38,14 @@ M2.4 owns the window.
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
+
+# Largest T*K*E for which the fused [T, K, E] membership reduction is used
+# (env DSV4_MEMBERSHIP_FUSED_BUDGET overrides; 0 forces the scatter path).
+_MEMBERSHIP_FUSED_BUDGET = int(os.environ.get("DSV4_MEMBERSHIP_FUSED_BUDGET", 1 << 24))
 
 __all__ = [
     "admissible_mask",
@@ -101,9 +107,13 @@ def admissible_mask(
     if selected_entries is not None:
         selected = jnp.asarray(selected_entries)
         num_entries = entry_ids.shape[1]
-        # TPU A/B favors the fused reduction for small candidate buckets;
-        # scatter avoids the large logical [T, K, E] reduction for long history.
-        if num_entries <= 2048:
+        # The fused reduction compares a logical [T, K, E] tensor, so its cost grows
+        # with the chunk size as well as the candidate bucket; the scatter path is
+        # O(T * K). Pick by the product (TPU A/B: fused wins only while the product
+        # is small, e.g. decode rows or short prefill chunks against short history).
+        num_rows = selected.shape[0]
+        fused_budget = int(_MEMBERSHIP_FUSED_BUDGET)
+        if num_entries <= 2048 and num_rows * selected.shape[1] * num_entries <= fused_budget:
             rows = jnp.arange(num_entries, dtype=selected.dtype)[None, None, :]
             chosen = jnp.any((selected[:, :, None] == rows) & (selected[:, :, None] >= 0), axis=1)
         else:

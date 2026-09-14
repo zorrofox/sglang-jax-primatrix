@@ -37,6 +37,24 @@ def test_context_ladder_env(monkeypatch):
         CompilationManager._compute_context_ladder()
 
 
+def test_full_context_ladder_covers_every_bucket(monkeypatch):
+    monkeypatch.setenv("SGLANG_JAX_PRECOMPILE_CONTEXT_LADDER", "full")
+    rungs = CompilationManager._compute_context_ladder(262144)
+    # 512 .. 262144 doubling: every ratio-4 bucket 128 .. 65536 appears exactly once.
+    assert rungs == [512 << i for i in range(10)]
+    assert [precompile_capacities(r)[4] for r in rungs] == [128 << i for i in range(10)]
+    # Non power-of-two maximum: the last rung is the maximum itself.
+    rungs = CompilationManager._compute_context_ladder(100000)
+    assert rungs[-1] == 100000 and rungs[-2] == 65536
+    assert precompile_capacities(100000)[4] == 32768
+    # Walking a chunked prefill up to any rung never meets an uncovered bucket.
+    covered = {tuple(sorted(precompile_capacities(r).items())) for r in rungs}
+    for ctx in range(256, 100001, 256):
+        assert tuple(sorted(precompile_capacities(ctx).items())) in covered
+    with pytest.raises(ValueError):
+        CompilationManager._compute_context_ladder(None)
+
+
 def test_set_precompile_context_only_touches_backends_that_opt_in():
     class Backend:
         precompile_context_len = None

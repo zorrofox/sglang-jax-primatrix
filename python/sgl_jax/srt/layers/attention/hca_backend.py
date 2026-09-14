@@ -496,6 +496,9 @@ class HCABackend(AttentionBackend):
             )
             return output.reshape(output.shape[0], -1), state, window, compressed
 
+        state_arg = recurrent_state_pool.get_hca_state(int(layer.layer_id))
+        window_arg = token_to_kv_pool.window_buffer[layer_index]
+        compressed_arg = token_to_kv_pool.compressed_buffer[layer_index]
         output, state, window, compressed = jax.shard_map(
             rank_local,
             mesh=self.mesh,
@@ -503,9 +506,9 @@ class HCABackend(AttentionBackend):
                 P("data", None),  # compressor_input [T, hidden]
                 P("data", "tensor", None),  # q                [T, H/tp, D]
                 P("data", None),  # new_kv           [T, D]
-                P("data", None, None, None),  # recurrent state pool
-                P("data", None, None, None),  # window cache
-                P("data", None, None, None),  # compressed cache
+                _data_spec(state_arg),  # recurrent state pool (rank follows the buffer)
+                _data_spec(window_arg),  # window cache
+                _data_spec(compressed_arg),  # compressed cache
                 P(None, None),  # wkv
                 P(None, None),  # wgate
                 P(None, None),  # ape
@@ -519,18 +522,18 @@ class HCABackend(AttentionBackend):
             ),
             out_specs=(
                 P("data", "tensor"),  # output [T, H/tp*D]
-                P("data", None, None, None),  # state pool
-                P("data", None, None, None),  # window cache
-                P("data", None, None, None),  # compressed cache
+                _data_spec(state_arg),  # state pool
+                _data_spec(window_arg),  # window cache
+                _data_spec(compressed_arg),  # compressed cache
             ),
             check_vma=False,
         )(
             compressor_input,
             q,
             new_kv,
-            recurrent_state_pool.get_hca_state(int(layer.layer_id)),
-            token_to_kv_pool.window_buffer[layer_index],
-            token_to_kv_pool.compressed_buffer[layer_index],
+            state_arg,
+            window_arg,
+            compressed_arg,
             wkv,
             wgate,
             ape,
@@ -563,3 +566,8 @@ class HCABackend(AttentionBackend):
 
 
 __all__ = ["HCABackend", "HCABackendMetadata"]
+
+
+def _data_spec(array) -> P:
+    """``P("data", None, ...)`` matching the array rank (flat or 4D pool views)."""
+    return P("data", *([None] * (array.ndim - 1)))

@@ -7,6 +7,7 @@ neither a second allocator nor a recurrent-slot free list.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -332,11 +333,19 @@ class DeepseekV4HCABackend(HCABackend):
         state = state.at[destinations].set(
             empty, mode="drop", out_sharding=scatter_sharding(self.mesh, 3)
         )
-        state_view = state.reshape(state.shape[0], 128, 2, self.head_dim)
-        window_view = window.reshape(-1, self.page_size // 2, 2, self.head_dim)
-        compressed_view = compressed.reshape(
-            compressed.shape[0], 1, self.page_size // 128, self.head_dim
-        )
+        if _flat_views():
+            # Flat row views: the kernels flatten to [rows, D] internally anyway, and the
+            # 4D views with tiny second-minor dims (2 / 1) cost a relayout copy of the
+            # whole buffer per layer per step on the way in and again on the way out.
+            state_view = state
+            window_view = window.reshape(-1, self.head_dim)
+            compressed_view = compressed.reshape(-1, self.head_dim)
+        else:
+            state_view = state.reshape(state.shape[0], 128, 2, self.head_dim)
+            window_view = window.reshape(-1, self.page_size // 2, 2, self.head_dim)
+            compressed_view = compressed.reshape(
+                compressed.shape[0], 1, self.page_size // 128, self.head_dim
+            )
         # These contain views only. Ownership, allocation and update validation
         # stay with C1; the standalone HCA allocator/pools are never constructed.
         kv_view = SimpleNamespace(
@@ -376,3 +385,8 @@ class DeepseekV4HCABackend(HCABackend):
             "token_to_kv_pool": {k: tuple(v) for k, v in kv.items()},
             "compressor_state_pool": {k: tuple(v) for k, v in state.items()},
         }
+
+
+def _flat_views() -> bool:
+    """``DSV4_HCA_FLAT_VIEWS=1``: hand the HCA kernels flat row buffers (see __call__)."""
+    return os.environ.get("DSV4_HCA_FLAT_VIEWS", "0") == "1"

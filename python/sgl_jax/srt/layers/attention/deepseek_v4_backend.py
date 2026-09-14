@@ -54,6 +54,15 @@ class DeepseekV4RuntimeMetadata(DeepseekV4HCAMetadata):
         return cls(children[0], aux[0], aux[1], children[1], children[2], children[3])
 
 
+class _PrecompileContextBox:
+    """Mutable holder that hashes by identity so its value stays out of jit cache keys."""
+
+    __slots__ = ("context_len",)
+
+    def __init__(self):
+        self.context_len: int | None = None
+
+
 class DeepseekV4AttentionBackend(AttentionBackend):
     def __init__(self, *, mesh, page_size, max_context_len, config=None):
         self.mesh = mesh
@@ -78,7 +87,19 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         # read-table capacity buckets from this context length instead of the (zero)
         # dummy sequence lengths, so every power-of-two bucket a real request can reach
         # is compiled at startup rather than on first use (~48 s per bucket on v7x).
-        self.precompile_context_len: int | None = None
+        # Kept in an identity-hashed box: a plain attribute would become part of the
+        # nnx graphdef and therefore of the jit cache key, so precompiled executables
+        # (context_len=N) would never match runtime calls (context_len=None) and every
+        # first use would still re-trace (~6 s each with the persistent cache).
+        self._precompile_box = _PrecompileContextBox()
+
+    @property
+    def precompile_context_len(self) -> int | None:
+        return self._precompile_box.context_len
+
+    @precompile_context_len.setter
+    def precompile_context_len(self, value: int | None) -> None:
+        self._precompile_box.context_len = value
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:

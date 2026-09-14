@@ -73,3 +73,21 @@ def test_set_precompile_context_only_touches_backends_that_opt_in():
 
     CompilationManager._set_precompile_context(Runner2(), 4096)  # no attribute, no error
     assert not hasattr(Runner2.attn_backend, "precompile_context_len")
+
+
+def test_precompile_context_len_does_not_change_the_graphdef():
+    # The ladder value must not leak into the nnx graphdef (== jit cache key), otherwise
+    # precompiled executables (context_len=N) never match runtime calls (context_len=None).
+    from flax import nnx
+
+    from sgl_jax.srt.layers.attention.deepseek_v4_backend import _PrecompileContextBox
+
+    class Holder(nnx.Module):
+        def __init__(self):
+            self._precompile_box = _PrecompileContextBox()
+
+    h = Holder()
+    before = nnx.graphdef(h)
+    h._precompile_box.context_len = 32768
+    assert nnx.graphdef(h) == before
+    assert hash(nnx.graphdef(h)) == hash(before)

@@ -35,6 +35,46 @@ from sgl_jax.srt.layers.attention.dsv4.metadata import (
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 
+def pack_metadata(*trees):
+    """Flatten integer/bool pytrees into one int32 vector plus a static layout.
+
+    The per-step attention metadata and read tables are ~60 small arrays. Uploading
+    them one by one costs ~230 us each on an 8-device mesh (each leaf is copied to
+    every device), ~15 ms per decode step. Packing them into a single vector makes it
+    one transfer; `unpack_metadata` restores the pytrees with static slices inside jit.
+    """
+    leaves, treedef = jax.tree_util.tree_flatten(trees)
+    specs, chunks, offset = [], [], 0
+    for leaf in leaves:
+        array = np.asarray(leaf)
+        if array.dtype == np.bool_:
+            kind = "bool"
+        elif np.issubdtype(array.dtype, np.integer) and array.dtype.itemsize <= 4:
+            kind = str(array.dtype)
+        else:
+            raise TypeError(f"metadata leaf dtype {array.dtype} cannot be packed as int32")
+        flat = array.astype(np.int32).reshape(-1)
+        specs.append((offset, flat.size, tuple(array.shape), kind))
+        chunks.append(flat)
+        offset += flat.size
+    packed = np.concatenate(chunks) if chunks else np.zeros((0,), np.int32)
+    return packed, (treedef, tuple(specs))
+
+
+def unpack_metadata(packed, layout):
+    """Inverse of `pack_metadata`; works on host arrays and inside jit."""
+    treedef, specs = layout
+    leaves = []
+    for offset, size, shape, kind in specs:
+        leaf = jax.lax.slice_in_dim(packed, offset, offset + size).reshape(shape)
+        if kind == "bool":
+            leaf = leaf != 0
+        elif kind != "int32":
+            leaf = leaf.astype(kind)
+        leaves.append(leaf)
+    return jax.tree_util.tree_unflatten(treedef, leaves)
+
+
 @jax.tree_util.register_pytree_node_class
 @dataclass
 class DeepseekV4RuntimeMetadata(DeepseekV4HCAMetadata):
@@ -42,16 +82,42 @@ class DeepseekV4RuntimeMetadata(DeepseekV4HCAMetadata):
     # to a rank, including cu_q_lens and the compression-boundary sentinels.
     attention: DeepseekV4AttentionMetadata | None = None
     read_tables: tuple = ()
+    # When set, `attention`/`read_tables` travel as one int32 vector (see pack_metadata)
+    # and `resolve()` rebuilds them; `layout` is static.
+    packed: jax.Array | None = None
+    layout: tuple | None = None
+
+    def has_metadata(self) -> bool:
+        return self.packed is not None or (self.attention is not None and bool(self.read_tables))
+
+    def resolve(self):
+        """``(attention, read_tables)`` whether or not the metadata is packed."""
+        if self.packed is None:
+            return self.attention, self.read_tables
+        attention, tables = unpack_metadata(self.packed, self.layout)
+        return attention, tuple(tables)
 
     def tree_flatten(self):
-        return (self.kernel, self.state_init_slots, self.attention, self.read_tables), (
-            self.schedule,
-            self.use_uniform_prefill_fast_path,
-        )
+        return (
+            self.kernel,
+            self.state_init_slots,
+            self.attention,
+            self.read_tables,
+            self.packed,
+        ), (self.schedule, self.use_uniform_prefill_fast_path, self.layout)
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        return cls(children[0], aux[0], aux[1], children[1], children[2], children[3])
+        return cls(
+            children[0],
+            aux[0],
+            aux[1],
+            children[1],
+            children[2],
+            children[3],
+            children[4],
+            aux[2],
+        )
 
 
 class DeepseekV4AttentionBackend(AttentionBackend):
@@ -213,14 +279,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             jax.tree.map(lambda *arrays: np.concatenate(arrays), *tables)
             for tables in tables_by_ratio.values()
         )
-        attention, device_tables = jax.device_put((host_attention, host_tables), sharding)
+        packed_host, layout = pack_metadata(host_attention, host_tables)
         return DeepseekV4RuntimeMetadata(
             hca.kernel,
             hca.schedule,
             hca.use_uniform_prefill_fast_path,
             hca.state_init_slots,
-            attention,
-            tuple(device_tables),
+            None,
+            (),
+            jax.device_put(packed_host, sharding),
+            layout,
         )
 
     def layer_ratio(self, layer, token_to_kv_pool) -> int:
@@ -288,16 +356,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             return output.reshape(q.shape), {"state": state, "swa": window, "c128": history}
         md = self.forward_metadata
-        if md.attention is None or not md.read_tables:
+        if not md.has_metadata():
             raise RuntimeError("V4 attention metadata has not been prepared")
+        attention, read_tables = md.resolve()
         return self.csa(
             q,
             k[:, 0] if k.ndim == 3 else k,
             hidden_states=compressor_input,
             layer_id=int(layer.layer_id),
             ratio=ratio,
-            metadata=md.attention,
-            tables=md.read_tables[(0, 4, 128).index(ratio)],
+            metadata=attention,
+            tables=read_tables[(0, 4, 128).index(ratio)],
             token_to_kv_pool=token_to_kv_pool,
             compressor_state_pool=compressor_state_pool,
             compressor=compressor,

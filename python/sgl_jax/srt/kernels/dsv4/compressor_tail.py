@@ -21,18 +21,17 @@ from jax.experimental.pallas import tpu as pltpu
 from sgl_jax.srt.kernels.dsv4.wo_a_projection import LANE, _rotate_gptj, widen_cos_sin
 
 
-def _kernel(comb_ref, valid_ref, nw_ref, cs_ref, out_ref, *, ratio, coff, head_dim, width, eps):
-    comb = comb_ref[...]  # [tn, W, 2*width] f32
-    window = comb.shape[1]
+def _kernel(comb_ref, nw_ref, cs_ref, out_ref, *, ratio, coff, head_dim, width, eps):
+    comb = comb_ref[...]  # [tn, W, 2*width] f32; invalid rows' scores are already -inf
+    tn, window = comb.shape[0], comb.shape[1]
     if coff == 2:
-        newer = jax.lax.broadcasted_iota(jnp.int32, (1, window, 1), 1) >= ratio
+        # Full-shape iota: Mosaic cannot broadcast a (1, W, 1) predicate across lanes.
+        newer = jax.lax.broadcasted_iota(jnp.int32, (tn, window, head_dim), 1) >= ratio
         kv = jnp.where(newer, comb[..., head_dim:width], comb[..., :head_dim])
         score = jnp.where(newer, comb[..., width + head_dim :], comb[..., width : width + head_dim])
     else:
         kv = comb[..., :width]
         score = comb[..., width:]
-    valid = (valid_ref[...] != 0)[:, :, None]  # [tn, W, 1]
-    score = jnp.where(valid, score, -jnp.inf)
     peak = jnp.max(score, axis=1, keepdims=True)
     weights = jnp.exp(score - peak)
     weights = weights / jnp.sum(weights, axis=1, keepdims=True)
@@ -69,9 +68,14 @@ def compressor_tail_pallas(
         raise ValueError(f"bad compressor geometry: {combined.shape}, width {width}, D {head_dim}")
     tn = min(block_n, -(-n // 8) * 8)
     n_pad = -(-n // tn) * tn
+    # Mask the score fields in XLA (one fused pass over the gathered rows): the
+    # kernel then needs no separate validity operand. Padded records are all-zero
+    # and stay finite; their output is dropped.
+    valid = jnp.asarray(valid_mask, bool)[:, :, None]
+    lane = jnp.arange(two_width)[None, None, :]
+    is_score = lane >= width
+    combined = jnp.where(is_score & ~valid, -jnp.inf, combined)
     comb = jnp.pad(combined, ((0, n_pad - n), (0, 0), (0, 0)))
-    # Padded records keep one valid row so their (discarded) softmax stays finite.
-    valid = jnp.pad(jnp.asarray(valid_mask, jnp.int32), ((0, n_pad - n), (0, 0)), constant_values=1)
     cos_sin = widen_cos_sin(cos, sin, rope_head_dim=rope_head_dim, inverse=False)
     cos_sin = jnp.pad(cos_sin, ((0, n_pad - n), (0, 0)))
     nw = jnp.asarray(norm_weight, jnp.float32).reshape(1, head_dim)
@@ -82,7 +86,6 @@ def compressor_tail_pallas(
         grid=(n_pad // tn,),
         in_specs=[
             pl.BlockSpec((tn, window, two_width), lambda i: (i, 0, 0)),
-            pl.BlockSpec((tn, window), lambda i: (i, 0)),
             pl.BlockSpec((1, head_dim), lambda i: (0, 0)),
             pl.BlockSpec((tn, 2 * LANE), lambda i: (i, 0)),
         ],
@@ -92,5 +95,5 @@ def compressor_tail_pallas(
             dimension_semantics=("parallel",), vmem_limit_bytes=32 * 1024 * 1024
         ),
         interpret=interpret,
-    )(comb, valid, nw, cos_sin)
+    )(comb, nw, cos_sin)
     return out[:n]

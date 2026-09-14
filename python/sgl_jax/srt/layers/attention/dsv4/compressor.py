@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 __all__ = [
     "compress_chunk",
@@ -73,11 +74,36 @@ def state_window(ratio: int) -> int:
     return overlap_factor(ratio) * ratio
 
 
+def _rope_constants(head_dim: int, rope_head_dim: int):
+    """Constant matrices for a slice-free interleaved RoPE (see `interleaved_rope`)."""
+    start = head_dim - rope_head_dim
+    half = rope_head_dim // 2
+    # partner[d, e]: e = 2i+1 <- -x[2i]... expressed as x @ J: J[2i+1, 2i] = -1, J[2i, 2i+1] = +1
+    # so that (x @ J)[2i] = -x[2i+1] and (x @ J)[2i+1] = x[2i] inside the trailing block.
+    j = np.zeros((head_dim, head_dim), np.float32)
+    for i in range(half):
+        e, o = start + 2 * i, start + 2 * i + 1
+        j[o, e] = -1.0
+        j[e, o] = 1.0
+    # spread[i, d]: cos_i / sin_i land on both members of pair i.
+    spread = np.zeros((half, head_dim), np.float32)
+    for i in range(half):
+        spread[i, start + 2 * i] = 1.0
+        spread[i, start + 2 * i + 1] = 1.0
+    head_ones = np.zeros((head_dim,), np.float32)
+    head_ones[:start] = 1.0
+    return j, spread, head_ones
+
+
 def interleaved_rope(x, cos, sin, rope_head_dim: int):
     """Interleaved (GPT-J) RoPE on the trailing ``rope_head_dim`` features.
 
-    Pairs are ``(even, odd)`` *within* the trailing block, which is why this cannot
-    be written as a half-rotate over the whole head.
+    Pairs are ``(even, odd)`` *within* the trailing block. Written without strided
+    slices / stack / concatenate (which each relayout the lane axis on TPU): the
+    pair partner is ``x @ J`` for a constant signed permutation matrix, and the
+    per-pair cos/sin are spread onto both lanes with a constant 0/1 matrix, so the
+    rotation is ``x * cos_full + (x @ J) * sin_full``. Every matmul has exactly one
+    nonzero term per output, so the result is bit-identical to the slice form.
     """
     head_dim = x.shape[-1]
     if rope_head_dim % 2 or rope_head_dim > head_dim:
@@ -86,13 +112,18 @@ def interleaved_rope(x, cos, sin, rope_head_dim: int):
         )
     if rope_head_dim == 0:
         return x
-    start = head_dim - rope_head_dim
-    head, tail = x[..., :start], x[..., start:]
-    even, odd = tail[..., 0::2], tail[..., 1::2]
-    rotated_even = even * cos - odd * sin
-    rotated_odd = even * sin + odd * cos
-    tail = jnp.stack((rotated_even, rotated_odd), axis=-1).reshape(tail.shape)
-    return jnp.concatenate((head, tail), axis=-1)
+    j, spread, head_ones = _rope_constants(head_dim, rope_head_dim)
+    hi = jax.lax.Precision.HIGHEST
+    x = jnp.asarray(x, jnp.float32)
+    partner = jnp.einsum("...d,de->...e", x, jnp.asarray(j), precision=hi)
+    cos_full = jnp.einsum(
+        "...i,id->...d", jnp.asarray(cos, jnp.float32), jnp.asarray(spread), precision=hi
+    )
+    sin_full = jnp.einsum(
+        "...i,id->...d", jnp.asarray(sin, jnp.float32), jnp.asarray(spread), precision=hi
+    )
+    cos_full = cos_full + jnp.asarray(head_ones)
+    return x * cos_full + partner * sin_full
 
 
 def project_tokens(x, wkv, wgate, ape, positions, *, ratio: int):

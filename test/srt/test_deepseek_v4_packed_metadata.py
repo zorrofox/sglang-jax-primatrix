@@ -68,3 +68,17 @@ def test_unpack_inside_jit_and_resolve():
 def test_pack_rejects_non_integer_leaves():
     with pytest.raises(TypeError):
         pack_metadata({"x": np.zeros(3, np.float32)}, ())
+
+
+def test_resolve_is_memoized_per_instance():
+    attention, tables = _trees()
+    packed, layout = pack_metadata(attention, tables)
+    md = DeepseekV4RuntimeMetadata(None, None, False, None, None, (), jnp.asarray(packed), layout)
+    a1 = md.resolve()
+    a2 = md.resolve()
+    assert a1 is a2
+    # a fresh instance (what jit's tree_unflatten produces per trace) does not share the memo
+    leaves, treedef = jax.tree_util.tree_flatten(md)
+    md2 = jax.tree_util.tree_unflatten(treedef, leaves)
+    assert md2.resolve() is not a1
+    _assert_tree_equal(md2.resolve(), a1)

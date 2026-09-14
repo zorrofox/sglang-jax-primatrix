@@ -91,11 +91,22 @@ class DeepseekV4RuntimeMetadata(DeepseekV4HCAMetadata):
         return self.packed is not None or (self.attention is not None and bool(self.read_tables))
 
     def resolve(self):
-        """``(attention, read_tables)`` whether or not the metadata is packed."""
+        """``(attention, read_tables)`` whether or not the metadata is packed.
+
+        The unpacked tree is memoized on the instance: every decoder layer calls the
+        backend with the same metadata object, so without the memo each layer re-emits
+        the ~60 static slices (thousands of small copy ops per step at 64 layers).
+        The memo never crosses a trace: jit rebuilds the object per trace and the host
+        builds a new one per step.
+        """
         if self.packed is None:
             return self.attention, self.read_tables
-        attention, tables = unpack_metadata(self.packed, self.layout)
-        return attention, tuple(tables)
+        cached = self.__dict__.get("_resolved")
+        if cached is None:
+            attention, tables = unpack_metadata(self.packed, self.layout)
+            cached = (attention, tuple(tables))
+            self.__dict__["_resolved"] = cached
+        return cached
 
     def tree_flatten(self):
         return (

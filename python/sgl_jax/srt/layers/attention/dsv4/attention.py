@@ -48,8 +48,8 @@ import jax.numpy as jnp
 # Default keeps the original rule (fused for E <= 2048): on v7x the O(T*K) scatter path measured
 # 17% slower for an 8192-token chunk against E = 2048, so the product budget is opt-in.
 _MEMBERSHIP_FUSED_BUDGET = int(os.environ.get("DSV4_MEMBERSHIP_FUSED_BUDGET", 1 << 62))
-# Units gathered per kernel chunk on the sparse CSA path (128-lane multiples fill the MXU).
-_CSA_SPARSE_BLOCK_UNITS = int(os.environ.get("DSV4_CSA_SPARSE_BLOCK_UNITS", 32))
+# Queries per program on the sparse CSA path (the block's selected-unit union is fetched once).
+_CSA_SPARSE_QUERY_BLOCK = int(os.environ.get("DSV4_CSA_SPARSE_QUERY_BLOCK", 256))
 
 __all__ = [
     "admissible_mask",
@@ -261,7 +261,9 @@ def csa_sparse_attention(
     is disabled (query position == last unit). The attention sink is applied
     afterwards from the kernel's log-sum-exp: ``out * L / (L + exp(sink))``.
     """
-    from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import sparse_mla_attention
+    from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
+        sparse_mla_attention_qblock,
+    )
 
     q = jnp.asarray(q)
     window_kv = jnp.asarray(window_kv)
@@ -299,13 +301,14 @@ def csa_sparse_attention(
     kdt = units.dtype if units.dtype in (jnp.bfloat16, jnp.float32) else jnp.bfloat16
     units = units.astype(kdt)
     positions = jnp.full((1, T), E + W - 1, jnp.int32)  # kernel bound disabled
-    out, lse = sparse_mla_attention(
+    out, lse = sparse_mla_attention_qblock(
         q.astype(kdt)[None],
         units[None],
         indices[None],
         positions,
         kv_lora_rank=D,
-        block_units=_CSA_SPARSE_BLOCK_UNITS,
+        read_block=1,
+        query_block=min(_CSA_SPARSE_QUERY_BLOCK, max(8, T)),
         sm_scale=float(softmax_scale),
         return_lse=True,
         interpret=interpret,

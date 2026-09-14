@@ -543,10 +543,13 @@ class DeepseekV4MoE(nnx.Module):
             dp_axis_name="data",
             tp_axis_name="tensor",
         )
+        # Reshard before dropping the pad rows: slicing the (data, tensor)-sharded
+        # token axis down to a size the 8 devices cannot divide is rejected.
+        target = out_sharding or jax.sharding.NamedSharding(mesh, P("data", None))
+        out = jax.sharding.reshard(out, target)
         if pad:
             out = out[:n_tokens]
-        target = out_sharding or jax.sharding.NamedSharding(mesh, P("data", None))
-        return jax.sharding.reshard(out, target)
+        return out
 
     def load_hash_table(self, table):
         """Load a host checkpoint tensor without floating-point dtype conversion."""

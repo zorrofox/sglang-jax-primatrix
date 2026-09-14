@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -465,6 +466,77 @@ class DeepseekV4MoE(nnx.Module):
         else:
             self.shared_experts = None
 
+    def _fused_experts(self, hidden_states, topk_weights, topk_ids, out_sharding):
+        """Route the routed experts through kernels/fused_moe v2 (one Pallas call per layer).
+
+        Uses the EPMoE module's own expert-sharded FP8 weights and per-channel scales
+        (``wi_0``/``wi_1``/``wo`` == kernel ``w1``/``w3``/``w2``); V4's biased grouped
+        top-k and the shared experts stay exactly as they are. Requires expert-parallel
+        weights (ep_size == number of devices), see ``_use_fused_moe``.
+        """
+        from sgl_jax.srt.kernels.fused_moe.v2.kernel import fused_ep_moe_v2
+        from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
+            get_tuned_fused_moe_v2_block_config,
+        )
+
+        ex = self.experts
+        mesh = ex.mesh
+        tok_sh = jax.sharding.NamedSharding(mesh, P(("data", "tensor"), None))
+        w_sh = jax.sharding.NamedSharding(mesh, P(("data", "tensor"), None, None))
+        s_sh = jax.sharding.NamedSharding(mesh, P(("data", "tensor"), None, None, None))
+        x = jax.sharding.reshard(hidden_states, tok_sh)
+        tw = jax.sharding.reshard(topk_weights.astype(jnp.float32), tok_sh)
+        ti = jax.sharding.reshard(topk_ids.astype(jnp.int32), tok_sh)
+        w1 = jax.sharding.reshard(ex.wi_0.value, w_sh)
+        w3 = jax.sharding.reshard(ex.wi_1.value, w_sh)
+        w2 = jax.sharding.reshard(ex.wo.value, w_sh)
+        scales = [
+            (
+                None
+                if getattr(ex, n, None) is None
+                else jax.sharding.reshard(getattr(ex, n).value, s_sh)
+            )
+            for n in ("wi_0_scale", "wi_1_scale", "wo_scale")
+        ]
+        quant_mode = "none" if scales[0] is None else "per_channel"
+        block_config = get_tuned_fused_moe_v2_block_config(
+            num_tokens=x.shape[0],
+            num_experts=ex.num_experts,
+            top_k=self.top_k,
+            hidden_size=self.hidden_size,
+            intermediate_size=ex.intermediate_dim,
+            dtype=x.dtype,
+            weight_dtype=w1.dtype,
+            ep_size=ex.ep_size,
+            use_shared_expert=False,
+            use_grouped_topk=False,
+            enable_act_quant=False,
+            quant_mode=quant_mode,
+        )
+        out = fused_ep_moe_v2(
+            mesh,
+            x,
+            w1,
+            w2,
+            w3,
+            tw,
+            ti,
+            self.top_k,
+            act_fn="silu",
+            swiglu_limit=ex.swiglu_limit,
+            block_config=block_config,
+            quant_block_k=None,
+            w1_scale=scales[0],
+            w2_scale=scales[2],
+            w3_scale=scales[1],
+            enable_act_quant=False,
+            direct_scaled_dot=scales[0] is not None,
+            dp_axis_name="data",
+            tp_axis_name="tensor",
+        )
+        target = out_sharding or jax.sharding.NamedSharding(mesh, P("data", None))
+        return jax.sharding.reshard(out, target)
+
     def load_hash_table(self, table):
         """Load a host checkpoint tensor without floating-point dtype conversion."""
         if not self.is_hash_layer:
@@ -548,7 +620,10 @@ class DeepseekV4MoE(nnx.Module):
         if self.is_hash_layer:
             valid = valid & (input_ids >= 0) & (input_ids < self.vocab_size)
         hidden_states = jnp.where(valid[:, None], hidden_states, 0)
-        output = self.experts(hidden_states, weights, ids, out_sharding=out_sharding)
+        if _use_fused_moe(self.experts):
+            output = self._fused_experts(hidden_states, weights, ids, out_sharding)
+        else:
+            output = self.experts(hidden_states, weights, ids, out_sharding=out_sharding)
         if self.shared_experts is not None:
             # routed_scaling_factor applies only to routed weights, exactly once.
             shared = self.shared_experts(hidden_states)
@@ -611,6 +686,17 @@ def _checkpoint_matrix(linear):
         scale = jnp.repeat(linear.weight_scale.value[:, 0, :], 128, axis=0).T
         return weight * scale
     return linear.weight.value.T
+
+
+def _use_fused_moe(experts) -> bool:
+    """``DSV4_MOE_BACKEND=fused`` routes routed experts through kernels/fused_moe v2.
+
+    Only meaningful with expert-parallel weights (``--ep-size`` == device count);
+    otherwise the EPMoE tensor-parallel path is kept regardless of the flag.
+    """
+    if os.environ.get("DSV4_MOE_BACKEND", "epmoe").lower() != "fused":
+        return False
+    return int(getattr(experts, "ep_size", 1)) == int(np.prod(list(experts.mesh.shape.values())))
 
 
 def _rope_cache(config, ratio):

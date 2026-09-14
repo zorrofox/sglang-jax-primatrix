@@ -7,7 +7,10 @@ import numpy as np
 import pytest
 
 from sgl_jax.srt.kernels.hca.attention import _cache_layout
-from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import (
+    DeepseekV4CacheSpec,
+    DeepseekV4TokenToKVPool,
+)
 from sgl_jax.srt.mem_cache.deepseek_v4.state import (
     DeepseekV4CompressStatePool,
     native_hca_layout,
@@ -79,3 +82,14 @@ def test_cache_layout_accepts_flat_rows_with_explicit_page_size():
         _cache_layout(paged, D, 256)  # shape and argument disagree
     with pytest.raises(ValueError):
         _cache_layout(jnp.zeros((4 * 128 + 1, D), jnp.bfloat16), D, 128)
+
+
+def test_native_kv_c128_family_is_paged_4d(monkeypatch):
+    spec = DeepseekV4CacheSpec(compress_ratios=(4, 128), head_dim=D, index_head_dim=16)
+    monkeypatch.setenv("DSV4_HCA_NATIVE_LAYOUT", "1")
+    pool = DeepseekV4TokenToKVPool(4 * 128, 2 * 128, 128, spec, _mesh())
+    assert pool.get_buffer("c128", 1).shape == (5, 1, 1, D)
+    assert pool.get_buffer("swa", 1).ndim == 2 and pool.get_buffer("c4", 0).ndim == 3
+    monkeypatch.setenv("DSV4_HCA_NATIVE_LAYOUT", "0")
+    legacy = DeepseekV4TokenToKVPool(4 * 128, 2 * 128, 128, spec, _mesh())
+    assert legacy.get_buffer("c128", 1).shape == (5, 1, D)

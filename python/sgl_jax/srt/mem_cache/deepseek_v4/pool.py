@@ -4,6 +4,7 @@ TP/EP replicate the single KV head; only the leading capacity axis is sharded
 on the existing attention ``data`` mesh axis. No raw full-history KV is stored.
 """
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache, partial
 
@@ -53,6 +54,16 @@ class DeepseekV4CacheSpec:
             len(self.layers(4)) * 8 * 4 * (self.head_dim + self.index_head_dim)
             + len(self.layers(128)) * 128 * 2 * self.head_dim
         )
+
+
+def native_hca_layout() -> bool:
+    """``DSV4_HCA_NATIVE_LAYOUT`` (default on): keep the ratio-128 compressor state in
+    the HCA kernels' physical ``[slots, 128, 2, D]`` layout and hand the kernels the
+    SWA pool's flat rows, instead of reshaping into those layouts per layer per step.
+    On TPU the ``[..., 2, D]`` layout occupies exactly the same HBM as ``[..., 2*D]``
+    (measured on v7x), but the reshape between them is a relayout copy of the whole
+    buffer on the way in and on the way out of every HCA layer."""
+    return os.environ.get("DSV4_HCA_NATIVE_LAYOUT", "1") != "0"
 
 
 @lru_cache(maxsize=128)
@@ -144,7 +155,16 @@ class DeepseekV4TokenToKVPool(_V4Buffers):
                 (self.swa_slots_per_rank * dp_size, spec.head_dim),
             ),
             "c4": (spec.layers(4), (pages, page_size // 4, spec.head_dim)),
-            "c128": (spec.layers(128), (pages, page_size // 128, spec.head_dim)),
+            "c128": (
+                spec.layers(128),
+                # The HCA kernels address this cache as [pages, 1, page/128, D]; allocating
+                # it that way (same bytes) avoids a relayout copy per HCA layer per step.
+                (
+                    (pages, 1, page_size // 128, spec.head_dim)
+                    if native_hca_layout()
+                    else (pages, page_size // 128, spec.head_dim)
+                ),
+            ),
             "indexer": (spec.layers(4), (pages, page_size // 4, spec.index_head_dim)),
         }
         self.layer_to_buffer = {

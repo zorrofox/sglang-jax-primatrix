@@ -1,25 +1,14 @@
 """Request-owned FP32 continuation state, separate from compressed KV history."""
 
-import os
-
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.mem_cache.deepseek_v4.pool import (
+from sgl_jax.srt.mem_cache.deepseek_v4.pool import (  # noqa: F401 (re-exported)
     _V4Buffers,
     allocate_buffer,
+    native_hca_layout,
     scatter_sharding,
 )
-
-
-def native_hca_layout() -> bool:
-    """``DSV4_HCA_NATIVE_LAYOUT`` (default on): keep the ratio-128 compressor state in
-    the HCA kernels' physical ``[slots, 128, 2, D]`` layout and hand the kernels the
-    SWA pool's flat rows, instead of reshaping into those layouts per layer per step.
-    On TPU the ``[..., 2, D]`` layout occupies exactly the same HBM as ``[..., 2*D]``
-    (measured on v7x), but the reshape between them is a relayout copy of the whole
-    buffer on the way in and on the way out of every HCA layer."""
-    return os.environ.get("DSV4_HCA_NATIVE_LAYOUT", "1") != "0"
 
 
 def score_slice(shape):

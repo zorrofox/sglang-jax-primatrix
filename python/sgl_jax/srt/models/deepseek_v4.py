@@ -699,6 +699,12 @@ def _use_fused_moe(experts) -> bool:
     return int(getattr(experts, "ep_size", 1)) == int(np.prod(list(experts.mesh.shape.values())))
 
 
+def _split_rope_cache(cache):
+    """``[N, 2*half]`` cos|sin table -> (cos, sin) halves, materialised once (not per step)."""
+    half = cache.shape[-1] // 2
+    return cache[:, :half], cache[:, half:]
+
+
 def _rope_cache(config, ratio):
     from sgl_jax.srt.layers.attention.dsv4.rope import build_dsv4_rope
 
@@ -723,13 +729,20 @@ class DeepseekV4Compressor(nnx.Module):
         self.ape = nnx.Param(jnp.zeros((ratio, width), jnp.float32, out_sharding=P(None, None)))
         self.norm = RMSNorm(head_dim, epsilon=config.rms_norm_eps, param_dtype=jnp.float32)
 
-    def weights(self, cache):
+    def weights(self, cache, halves=None):
         from sgl_jax.srt.layers.attention.deepseek_v4_csa_backend import (
             CompressorWeights,
         )
 
+        cos_table, sin_table = halves if halves is not None else (None, None)
         return CompressorWeights(
-            self.wkv.value, self.wgate.value, self.ape.value, self.norm.scale.value, cache
+            self.wkv.value,
+            self.wgate.value,
+            self.ape.value,
+            self.norm.scale.value,
+            cache,
+            cos_table,
+            sin_table,
         )
 
 
@@ -834,7 +847,23 @@ class DeepseekV4Attention(nnx.Module):
         )
         self.indexer = DeepseekV4Indexer(config, mesh, dtype) if self.ratio == 4 else None
 
-    def __call__(self, hidden, batch, pools, rope_cache):
+    def prepare_grouped_wo_a(self):
+        """Materialise the grouped, dequantised wo_a once after loading.
+
+        The forward used to dequantise (scale broadcast + multiply) and regroup wo_a on
+        every step; at bs=1 that was ~0.9 ms per decode step across the layers.
+        """
+        from sgl_jax.srt.layers.attention.dsv4.o_projection import group_wo_a
+
+        with jax.set_mesh(self.mesh):
+            weights = group_wo_a(
+                _checkpoint_matrix(self.wo_a),
+                num_groups=self.num_groups,
+                out_sharding=NamedSharding(self.mesh, P("tensor", None, None)),
+            )
+        self.wo_a_grouped = nnx.Param(weights)
+
+    def __call__(self, hidden, batch, pools, rope_cache, rope_halves=None):
         from sgl_jax.srt.layers.attention.dsv4.o_projection import group_wo_a
         from sgl_jax.srt.layers.attention.dsv4.rope import apply_dsv4_partial_rope
 
@@ -874,7 +903,11 @@ class DeepseekV4Attention(nnx.Module):
             pools.token_to_kv_pool,
             compressor_state_pool=pools.compressor_state_pool,
             compressor_input=hidden,
-            compressor=None if self.compressor is None else self.compressor.weights(rope_cache),
+            compressor=(
+                None
+                if self.compressor is None
+                else self.compressor.weights(rope_cache, rope_halves)
+            ),
             indexer=indexer,
             attention_sink=self.attn_sink.value,
             rope_head_dim=self.rope_head_dim,
@@ -889,11 +922,14 @@ class DeepseekV4Attention(nnx.Module):
             (output.shape[0], self.num_groups, self.num_heads // self.num_groups * self.head_dim),
             out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
         )
-        weights = group_wo_a(
-            _checkpoint_matrix(self.wo_a),
-            num_groups=self.num_groups,
-            out_sharding=NamedSharding(self.mesh, P("tensor", None, None)),
-        )
+        if getattr(self, "wo_a_grouped", None) is not None:
+            weights = self.wo_a_grouped.value
+        else:
+            weights = group_wo_a(
+                _checkpoint_matrix(self.wo_a),
+                num_groups=self.num_groups,
+                out_sharding=NamedSharding(self.mesh, P("tensor", None, None)),
+            )
         reduced = jnp.einsum("tgd,gdr->tgr", grouped, weights, preferred_element_type=jnp.float32)
         reduced = reduced.reshape(reduced.shape[0], -1).astype(self.dtype)
         output, _ = self.wo_b(reduced)
@@ -958,12 +994,12 @@ class DeepseekV4DecoderLayer(nnx.Module):
         )
         return compute(output, residual, post, comb)
 
-    def __call__(self, streams, batch, pools, rope_cache):
+    def __call__(self, streams, batch, pools, rope_cache, rope_halves=None):
         hidden, post, comb = self._mhc_pre(
             streams, self.hc_attn_fn.value, self.hc_attn_base.value, self.hc_attn_scale.value
         )
         attn, updates = self.self_attn(
-            self.attn_norm(hidden.astype(self.dtype)), batch, pools, rope_cache
+            self.attn_norm(hidden.astype(self.dtype)), batch, pools, rope_cache, rope_halves
         )
         streams = self._mhc_post(attn, streams, post, comb).astype(self.dtype)
         hidden, post, comb = self._mhc_pre(
@@ -1013,6 +1049,9 @@ class DeepseekV4Model(nnx.Module):
         self.norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, dtype=dtype)
         self.rope_plain = nnx.Variable(_rope_cache(config, 0))
         self.rope_compressed = nnx.Variable(_rope_cache(config, 4))
+        cos, sin = _split_rope_cache(self.rope_compressed.value)
+        self.rope_compressed_cos = nnx.Variable(cos)
+        self.rope_compressed_sin = nnx.Variable(sin)
 
     def _collapse_head(self, streams):
         params = (self.hc_head_fn.value, self.hc_head_base.value, self.hc_head_scale.value)
@@ -1041,7 +1080,12 @@ class DeepseekV4Model(nnx.Module):
         updates, ids = {}, []
         for i, layer in enumerate(self.layers):
             cache = self.rope_compressed if layer.self_attn.ratio else self.rope_plain
-            streams, updates[i], route_ids = layer(streams, batch, pools, cache.value)
+            halves = (
+                (self.rope_compressed_cos.value, self.rope_compressed_sin.value)
+                if layer.self_attn.ratio
+                else None
+            )
+            streams, updates[i], route_ids = layer(streams, batch, pools, cache.value, halves)
             ids.append(route_ids)
         hidden = self._collapse_head(streams)
         return (
@@ -1148,6 +1192,12 @@ class DeepseekV4ForCausalLM(nnx.Module):
         with jax.set_mesh(self.mesh):
             self.model.rope_plain.value = _rope_cache(self.config, 0)
             self.model.rope_compressed.value = _rope_cache(self.config, 4)
+            cos, sin = _split_rope_cache(self.model.rope_compressed.value)
+            self.model.rope_compressed_cos.value = cos
+            self.model.rope_compressed_sin.value = sin
+        # Per-step work that only depends on loaded weights is done once here.
+        for layer in self.model.layers:
+            layer.self_attn.prepare_grouped_wo_a()
 
     def _load_regular_weights(self, info):
         from safetensors import safe_open

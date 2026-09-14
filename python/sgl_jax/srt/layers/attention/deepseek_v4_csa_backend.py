@@ -27,6 +27,11 @@ class CompressorWeights(NamedTuple):
     ape: jax.Array
     norm_weight: jax.Array
     cos_sin_cache: jax.Array
+    # Optional pre-split halves of ``cos_sin_cache`` (built once at load): the HCA
+    # kernel takes separate cos/sin tables, and slicing the full table inside the
+    # jitted step costs a relayout of the whole table every step.
+    cos_table: jax.Array | None = None
+    sin_table: jax.Array | None = None
 
 
 class IndexerInputs(NamedTuple):

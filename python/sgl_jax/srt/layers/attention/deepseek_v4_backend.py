@@ -381,8 +381,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 wgate=compressor.wgate,
                 ape=compressor.ape,
                 norm_weight=compressor.norm_weight,
-                cos=cache[:, : cache.shape[-1] // 2],
-                sin=cache[:, cache.shape[-1] // 2 :],
+                cos=(
+                    compressor.cos_table
+                    if getattr(compressor, "cos_table", None) is not None
+                    else cache[:, : cache.shape[-1] // 2]
+                ),
+                sin=(
+                    compressor.sin_table
+                    if getattr(compressor, "sin_table", None) is not None
+                    else cache[:, cache.shape[-1] // 2 :]
+                ),
                 attention_sink=attention_sink,
                 metadata=self.forward_metadata,
             )

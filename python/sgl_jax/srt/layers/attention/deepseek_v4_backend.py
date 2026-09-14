@@ -195,21 +195,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
             )
         sharding = NamedSharding(self.mesh, P("data"))
-        attention = jax.tree.map(
-            lambda *arrays: jax.device_put(np.concatenate(arrays), sharding), *local
+        # Concatenate the DP ranks on the host, then upload the whole metadata pytree
+        # in ONE device_put: the ~60 leaves cost ~230 us each when uploaded one by one
+        # (~15 ms per step, the dominant host cost of a decode step), but a single
+        # batched transfer amortises the per-call dispatch and sharding work.
+        host_attention = jax.tree.map(lambda *arrays: np.concatenate(arrays), *local)
+        host_tables = tuple(
+            jax.tree.map(lambda *arrays: np.concatenate(arrays), *tables)
+            for tables in tables_by_ratio.values()
         )
+        attention, device_tables = jax.device_put((host_attention, host_tables), sharding)
         return DeepseekV4RuntimeMetadata(
             hca.kernel,
             hca.schedule,
             hca.use_uniform_prefill_fast_path,
             hca.state_init_slots,
             attention,
-            tuple(
-                jax.tree.map(
-                    lambda *arrays: jax.device_put(np.concatenate(arrays), sharding), *tables
-                )
-                for tables in tables_by_ratio.values()
-            ),
+            tuple(device_tables),
         )
 
     def layer_ratio(self, layer, token_to_kv_pool) -> int:

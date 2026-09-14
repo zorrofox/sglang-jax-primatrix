@@ -45,7 +45,9 @@ import jax.numpy as jnp
 
 # Largest T*K*E for which the fused [T, K, E] membership reduction is used
 # (env DSV4_MEMBERSHIP_FUSED_BUDGET overrides; 0 forces the scatter path).
-_MEMBERSHIP_FUSED_BUDGET = int(os.environ.get("DSV4_MEMBERSHIP_FUSED_BUDGET", 1 << 24))
+# Default keeps the original rule (fused for E <= 2048): on v7x the O(T*K) scatter path measured
+# 17% slower for an 8192-token chunk against E = 2048, so the product budget is opt-in.
+_MEMBERSHIP_FUSED_BUDGET = int(os.environ.get("DSV4_MEMBERSHIP_FUSED_BUDGET", 1 << 62))
 # Units gathered per kernel chunk on the sparse CSA path (128-lane multiples fill the MXU).
 _CSA_SPARSE_BLOCK_UNITS = int(os.environ.get("DSV4_CSA_SPARSE_BLOCK_UNITS", 32))
 

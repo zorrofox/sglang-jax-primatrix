@@ -48,6 +48,11 @@ import jax.numpy as jnp
 # Default keeps the original rule (fused for E <= 2048): on v7x the O(T*K) scatter path measured
 # 17% slower for an 8192-token chunk against E = 2048, so the product budget is opt-in.
 _MEMBERSHIP_FUSED_BUDGET = int(os.environ.get("DSV4_MEMBERSHIP_FUSED_BUDGET", 1 << 62))
+# How the [T, E] membership of the indexer's top-k rows is built: "packed" (default)
+# reduces a logical [T, K, E/32] tensor of one-bit words, "fused" the [T, K, E] one-hot
+# compare, "scatter" a per-row scatter. On v7x the fused path was 16% of an 8K prefill
+# chunk (137 ms of 835) because its work grows as T*K*E; packing cuts that 32x.
+_MEMBERSHIP_MODE = os.environ.get("DSV4_MEMBERSHIP", "packed")
 # Queries per program on the sparse CSA path (the block's selected-unit union is fetched once).
 _CSA_SPARSE_QUERY_BLOCK = int(os.environ.get("DSV4_CSA_SPARSE_QUERY_BLOCK", 0))  # 0 = auto
 
@@ -68,6 +73,28 @@ __all__ = [
 ]
 
 _NEG_INF = jnp.finfo(jnp.float32).min
+
+
+def packed_membership(selected, num_entries):
+    """``[T, E]`` bool: entry ``e`` is one of row ``t``'s ``selected`` ([T, K], -1 = unused).
+
+    Builds ``[T, ceil(E/32)]`` uint32 words by OR-reducing, over K, each selection's
+    single bit placed in its word (a fused reduction over a logical [T, K, W] tensor,
+    W = E/32), then expands each word's 32 bits back to the entry axis. Exact: no
+    threshold, no approximation, out-of-range selections are ignored.
+    """
+    selected = jnp.asarray(selected)
+    num_words = (num_entries + 31) // 32
+    valid = (selected >= 0) & (selected < num_entries)
+    word = jnp.where(valid, selected >> 5, num_words).astype(jnp.int32)  # invalid -> no lane
+    bit = jnp.left_shift(jnp.uint32(1), (selected & 31).astype(jnp.uint32))
+    lanes = jnp.arange(num_words, dtype=jnp.int32)[None, None, :]
+    placed = jnp.where(word[:, :, None] == lanes, bit[:, :, None], jnp.uint32(0))  # [T, K, W]
+    words = jnp.bitwise_or.reduce(placed, axis=1)  # [T, W]
+    expanded = jnp.broadcast_to(words[:, :, None], (words.shape[0], num_words, 32))
+    expanded = expanded.reshape(words.shape[0], num_words * 32)[:, :num_entries]
+    shifts = (jnp.arange(num_entries, dtype=jnp.int32) & 31).astype(jnp.uint32)[None, :]
+    return (jnp.right_shift(expanded, shifts) & jnp.uint32(1)) != 0
 
 
 def admissible_mask(
@@ -127,7 +154,9 @@ def admissible_mask(
         # is small, e.g. decode rows or short prefill chunks against short history).
         num_rows = selected.shape[0]
         fused_budget = int(_MEMBERSHIP_FUSED_BUDGET)
-        if num_entries <= 2048 and num_rows * selected.shape[1] * num_entries <= fused_budget:
+        if _MEMBERSHIP_MODE == "packed":
+            chosen = packed_membership(selected, num_entries)
+        elif num_entries <= 2048 and num_rows * selected.shape[1] * num_entries <= fused_budget:
             rows = jnp.arange(num_entries, dtype=selected.dtype)[None, None, :]
             chosen = jnp.any((selected[:, :, None] == rows) & (selected[:, :, None] >= 0), axis=1)
         else:

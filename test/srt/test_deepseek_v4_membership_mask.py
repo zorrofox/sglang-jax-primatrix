@@ -35,14 +35,32 @@ def _case(T, E, K, seed):
 def test_fused_and_scatter_membership_agree(monkeypatch):
     for T, E, K, seed in ((7, 300, 16, 0), (64, 2048, 64, 1), (33, 1500, 8, 2)):
         kw = _case(T, E, K, seed)
+        monkeypatch.setattr(att, "_MEMBERSHIP_MODE", "fused")
         monkeypatch.setattr(att, "_MEMBERSHIP_FUSED_BUDGET", 1 << 40)
         _, fused = att.admissible_mask(**kw)
         monkeypatch.setattr(att, "_MEMBERSHIP_FUSED_BUDGET", 0)
         _, scatter = att.admissible_mask(**kw)
+        monkeypatch.setattr(att, "_MEMBERSHIP_MODE", "packed")
+        _, packed = att.admissible_mask(**kw)
         np.testing.assert_array_equal(np.asarray(fused), np.asarray(scatter))
+        np.testing.assert_array_equal(np.asarray(fused), np.asarray(packed))
         # sanity: every selected, complete entry is admitted and nothing else beyond completeness
         sel = kw["selected_entries"]
         for t in range(T):
             row = np.asarray(fused)[t]
             chosen = set(int(x) for x in sel[t] if x >= 0)
             assert set(np.flatnonzero(row)).issubset(chosen)
+
+
+def test_packed_membership_edge_cases():
+    # E not a multiple of 32, unused (-1) and out-of-range slots, duplicates, bit 31 and bit 0.
+    E = 70
+    selected = np.array(
+        [[0, 31, 32, 63, 64, 69, -1, -1], [5, 5, 5, 70, 99, -1, -1, -1], [-1] * 8],
+        np.int32,
+    )
+    got = np.asarray(att.packed_membership(selected, E))
+    want = np.zeros((3, E), bool)
+    want[0, [0, 31, 32, 63, 64, 69]] = True
+    want[1, 5] = True
+    np.testing.assert_array_equal(got, want)

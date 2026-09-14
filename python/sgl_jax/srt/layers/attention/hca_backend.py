@@ -441,6 +441,7 @@ class HCABackend(AttentionBackend):
             "compress_ratio": self.compress_ratio,
             "head_dim": self.head_dim,
             "window_size": self.window_size,
+            "page_size": self.page_size,
             "schedule": metadata.schedule,
         }
         fused_weight = fused_projection_weight(wkv, wgate, fused_weight)

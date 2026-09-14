@@ -112,6 +112,7 @@ def hca_step(
     window_size: int = 128,
     norm_eps: float = 1e-6,
     fused_weight=None,
+    page_size: int | None = None,
 ):
     """Run one complete stateful HCA step for ``mode``.
 
@@ -171,6 +172,7 @@ def hca_step(
         "softmax_scale": softmax_scale,
         "window_size": window_size,
         "compress_ratio": compress_ratio,
+        "page_size": page_size,
     }
     if mode == "uniform":
         # Zero prefix and equal q_len let this specialization skip the history

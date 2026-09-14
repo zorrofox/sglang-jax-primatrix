@@ -7,7 +7,6 @@ neither a second allocator nor a recurrent-slot free list.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -30,6 +29,7 @@ from sgl_jax.srt.layers.attention.hca_backend import (
     _query_schedule,
 )
 from sgl_jax.srt.mem_cache.deepseek_v4.pool import scatter_sharding
+from sgl_jax.srt.mem_cache.deepseek_v4.state import native_hca_layout, score_slice
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 
@@ -323,32 +323,25 @@ class DeepseekV4HCABackend(HCABackend):
                 ranks * (self.request_capacity + 1) + init_slots,
                 state.shape[0],
             )
-            empty = (
-                jnp.zeros((init_slots.shape[0], *state.shape[1:]), state.dtype)
-                .at[..., self.head_dim :]
-                .set(-jnp.inf)
-            )
+            empty_shape = (init_slots.shape[0], *state.shape[1:])
+            empty = jnp.zeros(empty_shape, state.dtype).at[score_slice(empty_shape)].set(-jnp.inf)
             cache[key] = (destinations, empty)
         destinations, empty = cache[key]
         state = state.at[destinations].set(
-            empty, mode="drop", out_sharding=scatter_sharding(self.mesh, 3)
+            empty, mode="drop", out_sharding=scatter_sharding(self.mesh, state.ndim)
         )
-        if _flat_views():
-            # Flat window rows: the kernels flatten the window to [rows, D] anyway, and
-            # the (-1, page/2, 2, D) view costs a relayout copy of the whole buffer per
-            # layer per step on the way in and out. The state pool and the compressed
-            # cache keep their physical 4D layouts (the kernels validate those).
-            state_view = state.reshape(state.shape[0], 128, 2, self.head_dim)
-            window_view = window.reshape(-1, self.head_dim)
-            compressed_view = compressed.reshape(
-                compressed.shape[0], 1, self.page_size // 128, self.head_dim
-            )
+        if native_hca_layout():
+            # The state pool is already allocated in the kernels' [S, 128, 2, D] layout
+            # and the kernels address the window as flat rows (page size passed by the
+            # base backend), so neither buffer is relaid out on the way in or out.
+            state_view = state
+            window_view = window
         else:
             state_view = state.reshape(state.shape[0], 128, 2, self.head_dim)
             window_view = window.reshape(-1, self.page_size // 2, 2, self.head_dim)
-            compressed_view = compressed.reshape(
-                compressed.shape[0], 1, self.page_size // 128, self.head_dim
-            )
+        compressed_view = compressed.reshape(
+            compressed.shape[0], 1, self.page_size // 128, self.head_dim
+        )
         # These contain views only. Ownership, allocation and update validation
         # stay with C1; the standalone HCA allocator/pools are never constructed.
         kv_view = SimpleNamespace(
@@ -388,8 +381,3 @@ class DeepseekV4HCABackend(HCABackend):
             "token_to_kv_pool": {k: tuple(v) for k, v in kv.items()},
             "compressor_state_pool": {k: tuple(v) for k, v in state.items()},
         }
-
-
-def _flat_views() -> bool:
-    """``DSV4_HCA_FLAT_VIEWS=1``: hand the HCA kernels flat row buffers (see __call__)."""
-    return os.environ.get("DSV4_HCA_FLAT_VIEWS", "0") == "1"

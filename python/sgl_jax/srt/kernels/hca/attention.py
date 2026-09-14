@@ -45,13 +45,27 @@ def _data_out_sharding(rank: int):
     return P("data", *(None for _ in range(rank - 1)))
 
 
-def _cache_layout(cache, head_dim):
+def _cache_layout(cache, head_dim, page_size=None):
+    """Return ``(flat_rows, page_size)`` for a paged cache.
+
+    The kernels only ever address caches as flat ``[rows, head_dim]``; a 4D
+    ``[pages, page_size/packing, packing, head_dim]`` cache carries its page size
+    in its shape, while a flat ``[rows, head_dim]`` cache (the serving SWA pool's
+    native layout, which avoids a relayout copy of the whole buffer per layer per
+    step) needs ``page_size`` passed explicitly.
+    """
+    if cache.ndim == 2 and page_size is not None:
+        if cache.shape[-1] < head_dim or cache.shape[0] % page_size:
+            raise ValueError(f"flat cache must be [rows*page_size,head_dim], got {cache.shape}")
+        return cache, int(page_size)
     if cache.ndim != 4 or cache.shape[-1] < head_dim:
         raise ValueError(
             f"paged cache must be [pages,page_size/packing,packing,head_dim], got {cache.shape}"
         )
-    page_size = cache.shape[1] * cache.shape[2]
-    return cache.reshape(-1, cache.shape[-1]), page_size
+    shape_page_size = cache.shape[1] * cache.shape[2]
+    if page_size is not None and int(page_size) != shape_page_size:
+        raise ValueError(f"page_size {page_size} disagrees with cache shape {cache.shape}")
+    return cache.reshape(-1, cache.shape[-1]), shape_page_size
 
 
 def _page_table_locations(
@@ -1053,6 +1067,7 @@ def _chunk_attention(
         "window_size",
         "compress_ratio",
         "schedule",
+        "page_size",
     ),
     donate_argnums=(2, 3),
 )
@@ -1071,6 +1086,7 @@ def ragged_attention(
     softmax_scale: float,
     window_size: int = 128,
     compress_ratio: int = 128,
+    page_size: int | None = None,
 ):
     """Cache-aware ragged HCA for fresh/chunked prefill, decode, and mixed batches.
 
@@ -1116,7 +1132,7 @@ def ragged_attention(
 
     query_seq_ids = query_seq_ids.astype(jnp.int32)
     valid_token_mask = valid_token_mask.astype(jnp.bool_)
-    window_flat, window_page_size = _cache_layout(window_cache, head_dim)
+    window_flat, window_page_size = _cache_layout(window_cache, head_dim, page_size)
     compressed_flat, compressed_page_size = _cache_layout(compressed_cache, head_dim)
     # The q-block DMA path slices VMEM/HBM on TPU's eight-row tile boundary.
     if window_page_size % schedule.sublanes:
@@ -1305,7 +1321,7 @@ def ragged_attention(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("softmax_scale", "window_size", "compress_ratio", "schedule"),
+    static_argnames=("softmax_scale", "window_size", "compress_ratio", "schedule", "page_size"),
     donate_argnums=(2, 3),
 )
 def uniform_prefill_attention(
@@ -1321,6 +1337,7 @@ def uniform_prefill_attention(
     softmax_scale: float,
     window_size: int = 128,
     compress_ratio: int = 128,
+    page_size: int | None = None,
 ):
     """Run fresh-prompt HCA over physical SGLang pages.
 
@@ -1355,7 +1372,7 @@ def uniform_prefill_attention(
     compressed_page_indices = metadata.compressed_page_indices
     compressed_cu_kv_lens = metadata.compressed_cu_kv_lens
 
-    window_flat, window_page_size = _cache_layout(window_cache, head_dim)
+    window_flat, window_page_size = _cache_layout(window_cache, head_dim, page_size)
     compressed_flat, compressed_page_size = _cache_layout(compressed_cache, head_dim)
 
     # Only the last window survives in serving state; limiting the scatter to

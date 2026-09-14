@@ -98,8 +98,13 @@ class DeepseekV4RuntimeMetadata(DeepseekV4HCAMetadata):
             self.__dict__["_unpacked_trees"] = cached
         return cached
 
-    def hca_metadata(self):
-        """The HCA view ``(kernel, schedule, uniform, state_init_slots)`` of this step."""
+    def hca_metadata(self, mesh=None):
+        """The HCA view ``(kernel, schedule, uniform, state_init_slots)`` of this step.
+
+        Leaves unpacked inside the jitted step come out replicated; the HCA shard_map
+        expects every metadata leaf on ``P("data")`` (the spec the host upload used),
+        so reshard them when a mesh is given (a no-op layout for dp == 1).
+        """
         from sgl_jax.srt.layers.attention.deepseek_v4_hca_backend import (
             DeepseekV4HCAMetadata,
         )
@@ -111,10 +116,19 @@ class DeepseekV4RuntimeMetadata(DeepseekV4HCAMetadata):
                 self.use_uniform_prefill_fast_path,
                 self.state_init_slots,
             )
-        trees = self._unpacked()
-        return DeepseekV4HCAMetadata(
-            trees[2], self.schedule, self.use_uniform_prefill_fast_path, trees[3]
-        )
+        cached = self.__dict__.get("_hca_view")
+        if cached is None:
+            trees = self._unpacked()
+            kernel, init_slots = trees[2], trees[3]
+            if mesh is not None:
+                sharding = NamedSharding(mesh, P("data"))
+                kernel = jax.tree.map(lambda a: jax.sharding.reshard(a, sharding), kernel)
+                init_slots = jax.sharding.reshard(init_slots, sharding)
+            cached = DeepseekV4HCAMetadata(
+                kernel, self.schedule, self.use_uniform_prefill_fast_path, init_slots
+            )
+            self.__dict__["_hca_view"] = cached
+        return cached
 
     def resolve(self):
         """``(attention, read_tables)`` whether or not the metadata is packed.
@@ -422,7 +436,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     else cache[:, cache.shape[-1] // 2 :]
                 ),
                 attention_sink=attention_sink,
-                metadata=self.forward_metadata.hca_metadata(),
+                metadata=self.forward_metadata.hca_metadata(self.mesh),
             )
             return output.reshape(q.shape), {"state": state, "swa": window, "c128": history}
         md = self.forward_metadata

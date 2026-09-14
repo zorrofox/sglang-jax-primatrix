@@ -1,4 +1,4 @@
-"""csa_sparse_attention (gathered kernel, interpret mode) matches the dense dsv4_attention (CPU-only)."""
+"""csa_sparse_attention (gather-then-dense) matches the dense dsv4_attention (CPU-only)."""
 
 import jax
 import jax.numpy as jnp
@@ -56,7 +56,7 @@ def test_sparse_matches_dense():
     for seed in (0, 1, 2):
         q, wkv, ckv, kw = _case(seed)
         dense = np.asarray(dsv4_attention(q, wkv, ckv, **kw))
-        sparse = np.asarray(csa_sparse_attention(q, wkv, ckv, interpret=True, **kw))
+        sparse = np.asarray(csa_sparse_attention(q, wkv, ckv, **kw))
         assert dense.shape == sparse.shape
         np.testing.assert_allclose(sparse, dense, rtol=2e-2, atol=2e-2)
         assert np.all(sparse[-1] == 0.0)  # padded row
@@ -68,5 +68,12 @@ def test_sparse_no_selection_row_gives_window_only():
     sel[0, :] = -1
     kw["selected_entries"] = sel
     dense = np.asarray(dsv4_attention(q, wkv, ckv, **kw))
-    sparse = np.asarray(csa_sparse_attention(q, wkv, ckv, interpret=True, **kw))
+    sparse = np.asarray(csa_sparse_attention(q, wkv, ckv, **kw))
     np.testing.assert_allclose(sparse, dense, rtol=2e-2, atol=2e-2)
+
+
+def test_query_blocking_matches_single_block():
+    q, wkv, ckv, kw = _case(4)
+    one = np.asarray(csa_sparse_attention(q, wkv, ckv, **kw))
+    blocked = np.asarray(csa_sparse_attention(q, wkv, ckv, query_block=4, **kw))
+    np.testing.assert_allclose(blocked, one, rtol=1e-5, atol=1e-5)

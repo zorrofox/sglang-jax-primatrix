@@ -34,6 +34,15 @@ class CompressorWeights(NamedTuple):
     sin_table: jax.Array | None = None
 
 
+_COMPRESS_FIELDS = ("wkv", "wgate", "ape", "norm_weight", "cos_sin_cache")
+
+
+def _compress_kwargs(weights):
+    """The `compress_chunk` keyword arguments of a CompressorWeights (drops the pre-split tables)."""
+    d = weights._asdict()
+    return {k: d[k] for k in _COMPRESS_FIELDS}
+
+
 class IndexerInputs(NamedTuple):
     q: jax.Array
     weights: jax.Array
@@ -196,7 +205,7 @@ class DeepseekV4CSABackend(nnx.Module):
                     state=_reset_state(index_state_, md),
                     head_dim=iq.shape[-1],
                     rope_head_dim=rope_head_dim,
-                    compressor_weights=icw._asdict(),
+                    compressor_weights=_compress_kwargs(icw),
                 )
             output, updates = run_layer(
                 q=q_,
@@ -208,7 +217,7 @@ class DeepseekV4CSABackend(nnx.Module):
                 tables=read,
                 kv_buffers=buffers,
                 state=state_,
-                compressor_weights=None if cw is None else cw._asdict(),
+                compressor_weights=None if cw is None else _compress_kwargs(cw),
                 indexer=idx,
                 attention_sink=sink,
                 softmax_scale=softmax_scale,

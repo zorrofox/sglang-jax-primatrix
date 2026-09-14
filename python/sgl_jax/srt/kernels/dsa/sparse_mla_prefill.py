@@ -58,6 +58,7 @@ def _sparse_mla_kernel_chunked_hminor(
     *rest,  # [lse_ref [1, 1, Hp, 128] when emit_lse] + kv_scratch [CBR, Dk] VMEM + sem (G,)
     sm_scale: float,
     emit_lse: bool = False,
+    single_row_aligned: bool = False,  # RB == 1 flat: DMA the tile-aligned RBF-row block holding row u
     Dv: int,
     RB: int,
     RBF: int,
@@ -123,6 +124,11 @@ def _sparse_mla_kernel_chunked_hminor(
             pp = pt_ref[0, 0, 0, pidx]  # physical page id
             r8 = pp * (page_size // 8) + o0 // 8  # (P*page_size + o0) // 8, exact
             return kv_hbm.at[0, pl.ds(r8 * 8, RBF), :]
+        if single_row_aligned:
+            # A dynamic sublane offset must be provably tile-aligned for the DMA; fetch
+            # the RBF-row block that contains row u and let the lane mask keep row u only.
+            start = pl.multiple_of((u // RBF) * RBF, RBF)
+            return kv_hbm.at[b, pl.ds(start, RBF), :]
         return kv_hbm.at[b, pl.ds(u * RB, RBF), :]
 
     # padded lanes (>= G*RBF) are never DMA'd; zero them so a stale/NaN row can't
@@ -163,12 +169,18 @@ def _sparse_mla_kernel_chunked_hminor(
             u_vec = jnp.where(sel, u_g, u_vec)
             row_vec = jnp.where(sel, lane - lo, row_vec)
             ir_vec = jnp.where(sel, inr, ir_vec)
-        kp = u_vec * RB + row_vec  # [CBR] seq-local key positions
+        if single_row_aligned:
+            # the block holds rows [start, start+RBF); only lane row == u - start is row u
+            kp = u_vec
+            row_ok = row_vec == (u_vec - (u_vec // RBF) * RBF)
+        else:
+            kp = u_vec * RB + row_vec  # [CBR] seq-local key positions
+            row_ok = row_vec < RB
         # (u_vec >= 0) drops topk padding lanes (unit id -1); their DMA was
         # clamped to unit 0, so the read is safe and only the mask excludes them.
         # ``kv_len`` is the per-request bound (seq_lens[rid]); in the single-seq
         # path it equals the static T, so this is a strict generalisation.
-        valid = (u_vec >= 0) & (row_vec < RB) & (ir_vec > 0) & (kp <= qpos) & (kp < kv_len)
+        valid = (u_vec >= 0) & row_ok & (ir_vec > 0) & (kp <= qpos) & (kp < kv_len)
         bias = jnp.where(valid, 0.0, -jnp.inf)  # [CBR] fp32
 
         for g in range(G):
@@ -375,6 +387,7 @@ def sparse_mla_attention(
         page_size=ps,
         PTW=PTW,
         emit_lse=return_lse,
+        single_row_aligned=(RB == 1 and not paged),
     )
     scratch_shapes = [
         pltpu.VMEM((CBR, Dk_pad), kv.dtype),  # one chunk of gathered latent

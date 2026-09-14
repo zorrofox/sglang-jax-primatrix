@@ -48,6 +48,8 @@ import jax.numpy as jnp
 # Default keeps the original rule (fused for E <= 2048): on v7x the O(T*K) scatter path measured
 # 17% slower for an 8192-token chunk against E = 2048, so the product budget is opt-in.
 _MEMBERSHIP_FUSED_BUDGET = int(os.environ.get("DSV4_MEMBERSHIP_FUSED_BUDGET", 1 << 62))
+# Units gathered per kernel chunk on the sparse CSA path (128-lane multiples fill the MXU).
+_CSA_SPARSE_BLOCK_UNITS = int(os.environ.get("DSV4_CSA_SPARSE_BLOCK_UNITS", 32))
 
 __all__ = [
     "admissible_mask",
@@ -246,17 +248,21 @@ def csa_sparse_attention(
     window_size: int,
     ratio: int,
     selected_entries,
-    query_block: int | None = None,
+    interpret: bool = False,
 ):
     """`dsv4_attention` for the CSA path, attending only to the selected records.
 
     The dense path scores every one of the ``E`` gathered records and masks the
-    non-selected ones, so its cost grows with the history. Here each query gathers
-    its own ``K + W`` candidate rows (top-k records filtered by completeness and
-    request, plus the admissible window rows; -1 = unused) and attends to those
-    only, so the cost is ``O(T * (K + W))`` regardless of ``E``. Same softmax, mask
-    and sink semantics as the dense path; query blocks bound the gathered buffer.
+    non-selected ones, so its cost grows with the history; this path hands the
+    ``kernels/dsa`` gathered-attention kernel one unit table made of the ``E``
+    records followed by the ``W`` window rows, with per-query unit lists
+    ``[selected (completeness/request filtered, else -1) | admissible window rows]``.
+    Causality is enforced by that filtering, so the kernel's own positional bound
+    is disabled (query position == last unit). The attention sink is applied
+    afterwards from the kernel's log-sum-exp: ``out * L / (L + exp(sink))``.
     """
+    from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import sparse_mla_attention
+
     q = jnp.asarray(q)
     window_kv = jnp.asarray(window_kv)
     compressed_kv = jnp.asarray(compressed_kv)
@@ -290,37 +296,22 @@ def csa_sparse_attention(
 
     indices = jnp.concatenate((selected_units, window_units), axis=1)  # [T, K+W]
     units = jnp.concatenate((compressed_kv, window_kv), axis=0)  # [E+W, D]
-    kdt = jnp.bfloat16 if units.dtype == jnp.bfloat16 else jnp.float32
+    kdt = units.dtype if units.dtype in (jnp.bfloat16, jnp.float32) else jnp.bfloat16
     units = units.astype(kdt)
-    qk = q.astype(kdt)
-    scale = float(softmax_scale)
-    KW = indices.shape[1]
-
-    def block(q_blk, idx_blk, sink_):
-        keep = idx_blk >= 0  # [t, KW]
-        rows = units[jnp.where(keep, idx_blk, 0)]  # [t, KW, D]
-        scores = jnp.einsum("thd,tkd->thk", q_blk, rows, preferred_element_type=jnp.float32)
-        scores = jnp.where(keep[:, None, :], scores * scale, _NEG_INF)
-        shift = jnp.maximum(jnp.max(scores, axis=-1), sink_[None, :])[..., None]
-        probs = jnp.where(keep[:, None, :], jnp.exp(scores - shift), 0.0)
-        denominator = jnp.sum(probs, axis=-1, keepdims=True) + jnp.exp(sink_[None, :, None] - shift)
-        out = jnp.einsum(
-            "thk,tkd->thd", probs.astype(rows.dtype), rows, preferred_element_type=jnp.float32
-        )
-        return out / denominator
-
-    if query_block is None:
-        # ~<= 1 GiB of gathered rows per block.
-        query_block = max(8, min(T, (1 << 30) // max(1, KW * D * jnp.dtype(kdt).itemsize)))
-    if query_block >= T:
-        out = block(qk, indices, sink)
-    else:
-        nb = -(-T // query_block)
-        pad = nb * query_block - T
-        qk_p = jnp.pad(qk, ((0, pad), (0, 0), (0, 0)))
-        idx_p = jnp.pad(indices, ((0, pad), (0, 0)), constant_values=-1)
-        out = jax.lax.map(
-            lambda args: block(args[0], args[1], sink),
-            (qk_p.reshape(nb, query_block, H, D), idx_p.reshape(nb, query_block, KW)),
-        ).reshape(nb * query_block, H, D)[:T]
+    positions = jnp.full((1, T), E + W - 1, jnp.int32)  # kernel bound disabled
+    out, lse = sparse_mla_attention(
+        q.astype(kdt)[None],
+        units[None],
+        indices[None],
+        positions,
+        kv_lora_rank=D,
+        block_units=_CSA_SPARSE_BLOCK_UNITS,
+        sm_scale=float(softmax_scale),
+        return_lse=True,
+        interpret=interpret,
+    )
+    out, lse = out[0], lse[0]  # [T, H, D], [T, H]
+    # L / (L + exp(sink)) == 1 / (1 + exp(sink - lse)); lse == -inf (nothing attended) -> 0.
+    keep = 1.0 / (1.0 + jnp.exp(sink[None, :] - lse))
+    out = out * keep[..., None]
     return jnp.where(valid[:, :, None], out, 0.0)

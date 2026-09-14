@@ -298,18 +298,26 @@ class DeepseekV4HCABackend(HCABackend):
         init_slots = metadata.state_init_slots
         if init_slots is None:
             raise RuntimeError("V4 HCA metadata has not been prepared")
-        dp = int(self.mesh.shape["data"])
-        ranks = jnp.repeat(jnp.arange(dp, dtype=jnp.int32), init_slots.shape[0] // dp)
-        destinations = jnp.where(
-            init_slots < self.request_capacity,
-            ranks * (self.request_capacity + 1) + init_slots,
-            state.shape[0],
-        )
-        empty = (
-            jnp.zeros((init_slots.shape[0], *state.shape[1:]), state.dtype)
-            .at[..., self.head_dim :]
-            .set(-jnp.inf)
-        )
+        # The init destinations and the empty rows are identical for every HCA layer
+        # of a forward: build them once per metadata object (== once per trace) instead
+        # of re-emitting the index math and the -inf broadcast in each layer.
+        cache = metadata.__dict__.setdefault("_hca_init_cache", {})
+        key = (tuple(state.shape), str(state.dtype))
+        if key not in cache:
+            dp = int(self.mesh.shape["data"])
+            ranks = jnp.repeat(jnp.arange(dp, dtype=jnp.int32), init_slots.shape[0] // dp)
+            destinations = jnp.where(
+                init_slots < self.request_capacity,
+                ranks * (self.request_capacity + 1) + init_slots,
+                state.shape[0],
+            )
+            empty = (
+                jnp.zeros((init_slots.shape[0], *state.shape[1:]), state.dtype)
+                .at[..., self.head_dim :]
+                .set(-jnp.inf)
+            )
+            cache[key] = (destinations, empty)
+        destinations, empty = cache[key]
         state = state.at[destinations].set(
             empty, mode="drop", out_sharding=scatter_sharding(self.mesh, 3)
         )

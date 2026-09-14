@@ -32,17 +32,34 @@ that the Pallas path has a same-repo reference to be compared against.
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.layers.attention.dsv4.attention import dsv4_attention, update_window_kv
+from sgl_jax.srt.layers.attention.dsv4.attention import (
+    csa_sparse_attention,
+    dsv4_attention,
+    update_window_kv,
+)
 from sgl_jax.srt.layers.attention.dsv4.compressor import compress_chunk
 from sgl_jax.srt.layers.attention.dsv4.indexer import (
     csa_indexer_topk,
     csa_indexer_topk_kernel,
     resolve_indexer_backend,
 )
+
+
+def resolve_csa_attention_backend() -> str:
+    """``DSV4_CSA_ATTENTION=auto|sparse|dense`` (auto: sparse on TPU, dense elsewhere)."""
+    mode = os.environ.get("DSV4_CSA_ATTENTION", "auto").lower()
+    if mode == "auto":
+        return "sparse" if jax.default_backend() == "tpu" else "dense"
+    if mode not in ("sparse", "dense"):
+        raise ValueError(f"DSV4_CSA_ATTENTION must be auto|sparse|dense, got {mode!r}")
+    return mode
+
 
 __all__ = [
     "ReadTables",
@@ -344,7 +361,12 @@ def run_layer(
         )
         return out, updates
     window_kv = jnp.take(updates["swa"], jnp.asarray(tables.window_rows), axis=0)
-    out = dsv4_attention(
+    attend = (
+        csa_sparse_attention
+        if selected is not None and resolve_csa_attention_backend() == "sparse"
+        else dsv4_attention
+    )
+    out = attend(
         q,
         window_kv,
         compressed_kv,

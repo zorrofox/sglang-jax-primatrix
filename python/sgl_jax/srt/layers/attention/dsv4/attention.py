@@ -46,9 +46,12 @@ import jax.numpy as jnp
 # Largest T*K*E for which the fused [T, K, E] membership reduction is used
 # (env DSV4_MEMBERSHIP_FUSED_BUDGET overrides; 0 forces the scatter path).
 _MEMBERSHIP_FUSED_BUDGET = int(os.environ.get("DSV4_MEMBERSHIP_FUSED_BUDGET", 1 << 24))
+# Units gathered per kernel chunk on the sparse CSA path (128-lane multiples fill the MXU).
+_CSA_SPARSE_BLOCK_UNITS = int(os.environ.get("DSV4_CSA_SPARSE_BLOCK_UNITS", 32))
 
 __all__ = [
     "admissible_mask",
+    "csa_sparse_attention",
     "dsv4_attention",
     "update_window_kv",
 ]
@@ -224,3 +227,89 @@ def update_window_kv(window_kv, new_kv, write_loc, valid_mask):
     keep = jnp.asarray(valid_mask, bool) & (loc >= 0) & (loc < window_kv.shape[0])
     loc = jnp.where(keep, loc, window_kv.shape[0])
     return window_kv.at[loc].set(new_kv, mode="drop")
+
+
+def csa_sparse_attention(
+    q,
+    window_kv,
+    compressed_kv,
+    *,
+    query_positions,
+    query_request_ids,
+    valid_token_mask,
+    window_positions,
+    window_request_ids,
+    compressed_entry_ids,
+    compressed_request_ids,
+    attention_sink,
+    softmax_scale: float,
+    window_size: int,
+    ratio: int,
+    selected_entries,
+    interpret: bool = False,
+):
+    """`dsv4_attention` for the CSA path, attending only to the selected records.
+
+    The dense path scores every one of the ``E`` gathered records and masks the
+    non-selected ones, so its cost grows with the history; this path hands the
+    ``kernels/dsa`` gathered-attention kernel one unit table made of the ``E``
+    records followed by the ``W`` window rows, with per-query unit lists
+    ``[selected (completeness/request filtered, else -1) | admissible window rows]``.
+    Causality is enforced by that filtering, so the kernel's own positional bound
+    is disabled (query position == last unit). The attention sink is applied
+    afterwards from the kernel's log-sum-exp: ``out * L / (L + exp(sink))``.
+    """
+    from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import sparse_mla_attention
+
+    q = jnp.asarray(q)
+    window_kv = jnp.asarray(window_kv)
+    compressed_kv = jnp.asarray(compressed_kv)
+    if q.ndim != 3:
+        raise ValueError(f"q must be [T, H, D], got {q.shape}")
+    T, H, D = q.shape
+    W, E = window_kv.shape[0], compressed_kv.shape[0]
+    if window_kv.shape[-1] != D or compressed_kv.shape[-1] != D:
+        raise ValueError("window/compressed KV must share the query head dim")
+    if ratio <= 0:
+        raise ValueError("csa_sparse_attention requires a positive compression ratio")
+    sink = jnp.asarray(attention_sink, jnp.float32)
+    if sink.shape != (H,):
+        raise ValueError(f"attention_sink must be [H] = [{H}], got {sink.shape}")
+
+    qpos = jnp.asarray(query_positions, jnp.int32)[:, None]
+    qreq = jnp.asarray(query_request_ids, jnp.int32)[:, None]
+    valid = jnp.asarray(valid_token_mask, bool)[:, None]
+    wpos = jnp.asarray(window_positions, jnp.int32)[None, :]
+    wreq = jnp.asarray(window_request_ids, jnp.int32)[None, :]
+    window_mask = valid & (wreq == qreq) & (wpos <= qpos) & (wpos > qpos - window_size)
+    window_units = jnp.where(window_mask, E + jnp.arange(W, dtype=jnp.int32)[None, :], -1)
+
+    sel = jnp.asarray(selected_entries, jnp.int32)
+    entry_ids = jnp.asarray(compressed_entry_ids, jnp.int32)
+    creq = jnp.asarray(compressed_request_ids, jnp.int32)
+    safe = jnp.clip(sel, 0, max(E - 1, 0))
+    complete = entry_ids[safe] < ((qpos + 1) // ratio)
+    ok = (sel >= 0) & (sel < E) & valid & (creq[safe] == qreq) & complete
+    selected_units = jnp.where(ok, sel, -1)
+
+    indices = jnp.concatenate((selected_units, window_units), axis=1)  # [T, K+W]
+    units = jnp.concatenate((compressed_kv, window_kv), axis=0)  # [E+W, D]
+    kdt = units.dtype if units.dtype in (jnp.bfloat16, jnp.float32) else jnp.bfloat16
+    units = units.astype(kdt)
+    positions = jnp.full((1, T), E + W - 1, jnp.int32)  # kernel bound disabled
+    out, lse = sparse_mla_attention(
+        q.astype(kdt)[None],
+        units[None],
+        indices[None],
+        positions,
+        kv_lora_rank=D,
+        block_units=_CSA_SPARSE_BLOCK_UNITS,
+        sm_scale=float(softmax_scale),
+        return_lse=True,
+        interpret=interpret,
+    )
+    out, lse = out[0], lse[0]  # [T, H, D], [T, H]
+    # L / (L + exp(sink)) == 1 / (1 + exp(sink - lse)); lse == -inf (nothing attended) -> 0.
+    keep = 1.0 / (1.0 + jnp.exp(sink[None, :] - lse))
+    out = out * keep[..., None]
+    return jnp.where(valid[:, :, None], out, 0.0)

@@ -55,10 +55,9 @@ def _sparse_mla_kernel_chunked_hminor(
     kv_hbm,  # flat: [B, T(+RBF), Dk] HBM;  paged: [1, num_pages*page_size, Dk] HBM
     pt_ref,  # [1, 1, 1, PTW] SMEM  page table (per-request slice at base + logical page)
     o_ref,  # [1, 1, Hp, Dv]
-    kv_scratch,  # [CBR, Dk] VMEM  one chunk of gathered latent
-    sem,  # DMA semaphores (G,)
-    *,
+    *rest,  # [lse_ref [1, 1, Hp, 128] when emit_lse] + kv_scratch [CBR, Dk] VMEM + sem (G,)
     sm_scale: float,
+    emit_lse: bool = False,
     Dv: int,
     RB: int,
     RBF: int,
@@ -84,6 +83,11 @@ def _sparse_mla_kernel_chunked_hminor(
     dynamic gather, no integer div/mod on a vector): each chunk selects every lane's
     unit id / row offset with ``G`` broadcasted ``where`` ops, recovers key positions,
     and turns the boolean into a ``0 / -inf`` additive bias."""
+    if emit_lse:
+        lse_ref, kv_scratch, sem = rest
+    else:
+        lse_ref = None
+        kv_scratch, sem = rest
     b = pl.program_id(0)
     Hp = q_ref.shape[2]
     q = q_ref[0, 0]  # [Hp, Dk] bf16
@@ -204,6 +208,11 @@ def _sparse_mla_kernel_chunked_hminor(
     m_i, l_i, acc = jax.lax.fori_loop(0, NC, chunk_body, (m0, l0, acc0))
     out = acc / jnp.where(l_i == 0.0, 1.0, l_i)[:, None]
     o_ref[0, 0] = out.astype(o_ref.dtype)
+    if emit_lse:
+        # log-sum-exp of the attended logits per head (-inf when nothing was attended),
+        # broadcast over the 128 lanes of the output tile.
+        lse = jnp.where(l_i == 0.0, -jnp.inf, m_i + jnp.log(jnp.where(l_i == 0.0, 1.0, l_i)))
+        lse_ref[0, 0] = jnp.broadcast_to(lse[:, None], lse_ref.shape[2:]).astype(lse_ref.dtype)
 
 
 def sparse_mla_attention(
@@ -217,6 +226,7 @@ def sparse_mla_attention(
     block_units: int | None = None,  # units gathered+matmul'd per chunk (G; parallelism knob)
     sm_scale: float | None = None,  # REQUIRED: 1/sqrt(qk_nope_head_dim + qk_rope_head_dim)
     interpret: bool = False,
+    return_lse: bool = False,  # also return the per-(b, s, h) log-sum-exp of the attended logits
     page_table=None,  # [B, max_pages] int32: logical page -> physical page. When set,
     # ``kv`` is the packed 4D paged cache and the kernel gathers from it.
     page_size: int | None = None,  # tokens/page (required with page_table)
@@ -364,6 +374,7 @@ def sparse_mla_attention(
         paged=paged,
         page_size=ps,
         PTW=PTW,
+        emit_lse=return_lse,
     )
     scratch_shapes = [
         pltpu.VMEM((CBR, Dk_pad), kv.dtype),  # one chunk of gathered latent
@@ -382,18 +393,28 @@ def sparse_mla_attention(
     ]
     call_args = [q, indices4, positions4, kvlen_arg, base_arg, kv, pt_arg]
 
-    out = pl.pallas_call(
+    out_specs = pl.BlockSpec((1, 1, Hq, Dv), lambda b, s: (b, s, 0, 0))
+    out_shape = jax.ShapeDtypeStruct((B, S, Hq, Dv), jnp.float32)
+    if return_lse:
+        out_specs = (out_specs, pl.BlockSpec((1, 1, Hq, 128), lambda b, s: (b, s, 0, 0)))
+        out_shape = (out_shape, jax.ShapeDtypeStruct((B, S, Hq, 128), jnp.float32))
+    res = pl.pallas_call(
         kernel,
         grid=(B, S),
         in_specs=in_specs,
-        out_specs=pl.BlockSpec((1, 1, Hq, Dv), lambda b, s: (b, s, 0, 0)),
-        out_shape=jax.ShapeDtypeStruct((B, S, Hq, Dv), jnp.float32),
+        out_specs=out_specs,
+        out_shape=out_shape,
         scratch_shapes=scratch_shapes,
         interpret=interpret,
     )(*call_args)
+    if return_lse:
+        out, lse = res
+        lse = lse[:, :, :H, 0]
+    else:
+        out = res
     if Hq != H:
         out = out[:, :, :H, :]  # drop padded heads
-    return out
+    return (out, lse) if return_lse else out
 
 
 def prefill_write_and_attend(

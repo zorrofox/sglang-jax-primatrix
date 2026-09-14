@@ -246,16 +246,10 @@ def device_array(data, sharding=None, **kwargs) -> jax.Array:
         return jax.device_put(data, device=sharding, **kwargs)
 
     sharding = canonicalize_sharding(sharding)
-
-    def _to_device(arr):
-        arr = np.asarray(arr)
-
-        def fn(idx, a=arr):
-            return a[idx]
-
-        return jax.make_array_from_callback(arr.shape, sharding, fn)
-
-    return jax.tree.map(_to_device, data)
+    # One batched transfer for the whole pytree: per-leaf make_array_from_callback
+    # dispatches each array (and each device shard) separately, which at bs=1 decode
+    # was ~4 ms of host time per step for the ~20 small batch fields.
+    return jax.device_put(jax.tree.map(np.asarray, data), sharding)
 
 
 _IS_TPU_RUNTIME_CACHED: bool | None = None

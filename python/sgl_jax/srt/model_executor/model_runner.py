@@ -465,13 +465,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 # dynamic args so precompile vs runtime keys can be diffed offline.
                 import hashlib
 
-                from jax._src.api_util import shaped_abstractify
-
                 leaves, treedef = jax.tree_util.tree_flatten((forward_batch, logits_metadata))
                 parts = []
                 for i, leaf in enumerate(leaves):
                     try:
-                        a = shaped_abstractify(leaf)
+                        a = jax.typeof(leaf)
                         parts.append(f"{i}:{a.dtype}{tuple(a.shape)}w{int(a.weak_type)}")
                     except Exception:
                         parts.append(f"{i}:{type(leaf).__name__}")

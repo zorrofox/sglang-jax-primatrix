@@ -194,6 +194,25 @@ def pool_normalize_rope(
     return interleaved_rope(normed, cos, sin, rope_head_dim)
 
 
+def select_window_fields(combined, offsets, *, ratio: int, coff: int, head_dim: int, width: int):
+    """Pick each window row's content/score field: ``(kv_window, score_window)``, ``[N, W, D]``.
+
+    With ``coff == 2`` the older half of the window reads field 0 and the newer half
+    field 1; with ``coff == 1`` both halves read the single field. Written as static
+    lane slices plus one select (no per-element gather): identical values to a
+    ``take_along_axis`` with ``cols = field + arange(D)``.
+    """
+    offsets = jnp.asarray(offsets)
+    if coff == 2:
+        newer = (offsets >= ratio)[None, :, None]
+        kv_window = jnp.where(newer, combined[..., head_dim:width], combined[..., :head_dim])
+        score_window = jnp.where(
+            newer, combined[..., width + head_dim :], combined[..., width : width + head_dim]
+        )
+        return kv_window, score_window
+    return combined[..., :width], combined[..., width:]
+
+
 def _window_rows(state, chunk_rows, positions_in_window, chunk_index, from_chunk):
     """One window's rows, taken from the old ring or from this chunk.
 
@@ -291,14 +310,9 @@ def compress_chunk(
 
     # The overlap: the older half of the window reads content/score field 0, the
     # newer half reads field 1. With coff == 1 both halves read the same field.
-    field = (
-        (offsets >= ratio).astype(jnp.int32) * head_dim
-        if coff == 2
-        else jnp.zeros((window,), jnp.int32)
+    kv_window, score_window = select_window_fields(
+        combined, offsets, ratio=ratio, coff=coff, head_dim=head_dim, width=width
     )
-    cols = field[None, :, None] + jnp.arange(head_dim)[None, None, :]
-    kv_window = jnp.take_along_axis(combined[..., :width], cols, axis=2)
-    score_window = jnp.take_along_axis(combined[..., width:], cols, axis=2)
 
     cos_sin = jnp.asarray(cos_sin_cache, jnp.float32)[jnp.asarray(boundary_compressed_pos)]
     half = rope_head_dim // 2

@@ -508,6 +508,9 @@ class DeepseekV4MoE(nnx.Module):
             for n in ("wi_0_scale", "wi_1_scale", "wo_scale")
         ]
         quant_mode = "none" if scales[0] is None else "per_channel"
+        # fp8 per-token activation quant inside the kernel (what EPMoE does via qmm);
+        # opt-in while we measure it against the bf16-activation path.
+        act_quant = os.environ.get("DSV4_FUSED_ACT_QUANT", "0") == "1" and scales[0] is not None
         block_config = get_tuned_fused_moe_v2_block_config(
             num_tokens=x.shape[0],
             num_experts=ex.num_experts,
@@ -519,7 +522,7 @@ class DeepseekV4MoE(nnx.Module):
             ep_size=ex.ep_size,
             use_shared_expert=False,
             use_grouped_topk=False,
-            enable_act_quant=False,
+            enable_act_quant=act_quant,
             quant_mode=quant_mode,
         )
         out = fused_ep_moe_v2(
@@ -538,7 +541,7 @@ class DeepseekV4MoE(nnx.Module):
             w1_scale=scales[0],
             w2_scale=scales[2],
             w3_scale=scales[1],
-            enable_act_quant=False,
+            enable_act_quant=act_quant,
             direct_scaled_dot=scales[0] is not None,
             dp_axis_name="data",
             tp_axis_name="tensor",

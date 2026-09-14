@@ -484,6 +484,15 @@ class DeepseekV4MoE(nnx.Module):
         tok_sh = jax.sharding.NamedSharding(mesh, P(("data", "tensor"), None))
         w_sh = jax.sharding.NamedSharding(mesh, P(("data", "tensor"), None, None))
         s_sh = jax.sharding.NamedSharding(mesh, P(("data", "tensor"), None, None, None))
+        # The kernel shards tokens over every device: pad the token axis to a multiple
+        # of the device count (zero rows routed to expert 0 with weight 0), slice after.
+        n_tokens = hidden_states.shape[0]
+        n_dev = int(np.prod(list(mesh.shape.values())))
+        pad = (-n_tokens) % n_dev
+        if pad:
+            hidden_states = jnp.pad(hidden_states, ((0, pad), (0, 0)))
+            topk_weights = jnp.pad(topk_weights, ((0, pad), (0, 0)))
+            topk_ids = jnp.pad(topk_ids, ((0, pad), (0, 0)))
         x = jax.sharding.reshard(hidden_states, tok_sh)
         tw = jax.sharding.reshard(topk_weights.astype(jnp.float32), tok_sh)
         ti = jax.sharding.reshard(topk_ids.astype(jnp.int32), tok_sh)
@@ -534,6 +543,8 @@ class DeepseekV4MoE(nnx.Module):
             dp_axis_name="data",
             tp_axis_name="tensor",
         )
+        if pad:
+            out = out[:n_tokens]
         target = out_sharding or jax.sharding.NamedSharding(mesh, P("data", None))
         return jax.sharding.reshard(out, target)
 

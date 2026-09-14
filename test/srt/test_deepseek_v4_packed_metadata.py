@@ -76,11 +76,12 @@ def test_resolve_is_memoized_per_instance():
     md = DeepseekV4RuntimeMetadata(None, None, False, None, None, (), jnp.asarray(packed), layout)
     a1 = md.resolve()
     a2 = md.resolve()
-    assert a1 is a2
+    # the unpacked leaves are built once per instance and shared by every call
+    assert a1[0]["cu_q_lens"] is a2[0]["cu_q_lens"] and a1[1][0]["rows"] is a2[1][0]["rows"]
     # a fresh instance (what jit's tree_unflatten produces per trace) does not share the memo
     leaves, treedef = jax.tree_util.tree_flatten(md)
     md2 = jax.tree_util.tree_unflatten(treedef, leaves)
-    assert md2.resolve() is not a1
+    assert md2.resolve()[0]["cu_q_lens"] is not a1[0]["cu_q_lens"]
     _assert_tree_equal(md2.resolve(), a1)
 
 

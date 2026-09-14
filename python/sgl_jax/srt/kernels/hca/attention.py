@@ -126,9 +126,23 @@ def _gather_physical_rows(flat_cache, locations, valid, head_dim):
     return jnp.where(valid[..., None], selected, 0)
 
 
-def _scatter_physical_rows(flat_cache, locations, values, valid):
-    safe = jnp.where(valid, locations, flat_cache.shape[0]).astype(jnp.int32).reshape(-1)
+def _scatter_physical_rows(flat_cache, locations, values, valid, *, max_rows=None):
+    """Masked row scatter. ``max_rows``: a static bound on the number of valid rows;
+    when it is well below the candidate count the valid rows are compacted first,
+    so the scatter only carries rows that will land (XLA's scatter cost follows the
+    update count, not the mask; a ragged 8K chunk commits about 128 window rows and
+    64 compressed records out of 8192 candidates each)."""
+    valid = jnp.asarray(valid, jnp.bool_).reshape(-1)
+    locations = jnp.asarray(locations).reshape(-1)
     values = values.reshape(-1, values.shape[-1])
+    if max_rows is not None and max_rows < valid.shape[0]:
+        (picked,) = jnp.nonzero(valid, size=int(max_rows), fill_value=valid.shape[0])
+        keep = picked < valid.shape[0]
+        picked = jnp.minimum(picked, valid.shape[0] - 1)
+        locations = jnp.where(keep, locations[picked], flat_cache.shape[0])
+        values = values[picked]
+        valid = keep
+    safe = jnp.where(valid, locations, flat_cache.shape[0]).astype(jnp.int32)
     padded = jnp.pad(
         values.astype(flat_cache.dtype),
         ((0, 0), (0, flat_cache.shape[-1] - values.shape[-1])),
@@ -170,7 +184,13 @@ def _commit_window_rows(
         sequence_ids=query_seq_ids,
     )
     final_window = valid & (positions >= seq_lens[query_seq_ids] - window_size)
-    return _scatter_physical_rows(window_flat, locations, new_kv, final_window)
+    return _scatter_physical_rows(
+        window_flat,
+        locations,
+        new_kv,
+        final_window,
+        max_rows=int(seq_lens.shape[0]) * int(window_size),
+    )
 
 
 def _write_cache_rows_kernel(
@@ -1169,6 +1189,7 @@ def ragged_attention(
             compressed_write_locs,
             compressed_write_values,
             compressed_write_valid,
+            max_rows=tokens // compress_ratio + batch,
         )
         compressed_cache = compressed_flat.reshape(compressed_cache.shape)
 

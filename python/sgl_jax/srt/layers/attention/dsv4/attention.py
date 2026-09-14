@@ -49,7 +49,16 @@ import jax.numpy as jnp
 # 17% slower for an 8192-token chunk against E = 2048, so the product budget is opt-in.
 _MEMBERSHIP_FUSED_BUDGET = int(os.environ.get("DSV4_MEMBERSHIP_FUSED_BUDGET", 1 << 62))
 # Queries per program on the sparse CSA path (the block's selected-unit union is fetched once).
-_CSA_SPARSE_QUERY_BLOCK = int(os.environ.get("DSV4_CSA_SPARSE_QUERY_BLOCK", 256))
+_CSA_SPARSE_QUERY_BLOCK = int(os.environ.get("DSV4_CSA_SPARSE_QUERY_BLOCK", 0))  # 0 = auto
+
+
+def _csa_query_block(num_queries: int, local_heads: int) -> int:
+    """Queries per program for the blocked kernel: keep QB*H <= 512 rows so the f32
+    output block, the q block and the union membership table fit scoped VMEM
+    (QB=256 with 8 local heads overflowed on v7x)."""
+    qb = _CSA_SPARSE_QUERY_BLOCK or max(8, (512 // max(1, local_heads)) // 8 * 8)
+    return int(min(qb, max(8, -(-num_queries // 8) * 8)))
+
 
 __all__ = [
     "admissible_mask",
@@ -308,7 +317,7 @@ def csa_sparse_attention(
         positions,
         kv_lora_rank=D,
         read_block=1,
-        query_block=min(_CSA_SPARSE_QUERY_BLOCK, max(8, T)),
+        query_block=_csa_query_block(T, H),
         sm_scale=float(softmax_scale),
         return_lse=True,
         interpret=interpret,

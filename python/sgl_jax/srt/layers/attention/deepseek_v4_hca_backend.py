@@ -120,7 +120,14 @@ class DeepseekV4HCABackend(HCABackend):
         )
 
     def get_forward_metadata(
-        self, batch, *, request_pool, allocator, state_init_mask=None, fixed_bucket=False
+        self,
+        batch,
+        *,
+        request_pool,
+        allocator,
+        state_init_mask=None,
+        fixed_bucket=False,
+        device=True,
     ):
         dp = int(self.mesh.shape["data"])
         if allocator.dp_size != dp or allocator.page_size != self.page_size:
@@ -262,13 +269,17 @@ class DeepseekV4HCABackend(HCABackend):
                     max_queries_per_request=max_queries,
                 )
             )
+        init_slots_host = np.where(init, slots, self.request_capacity).astype(np.int32)
+        if not device:
+            # Host arrays only: the caller packs them with the rest of the step metadata
+            # into one transfer (14 separate device_puts cost ~3.5 ms per step).
+            combined = jax.tree.map(lambda *leaves: np.concatenate(leaves), *metadata)
+            return DeepseekV4HCAMetadata(combined, schedule, uniform, init_slots_host)
         sharding = NamedSharding(self.mesh, P("data"))
         combined = jax.tree.map(
             lambda *leaves: jax.device_put(np.concatenate(leaves), sharding), *metadata
         )
-        init_slots = jax.device_put(
-            np.where(init, slots, self.request_capacity).astype(np.int32), sharding
-        )
+        init_slots = jax.device_put(init_slots_host, sharding)
         return DeepseekV4HCAMetadata(combined, schedule, uniform, init_slots)
 
     def __call__(

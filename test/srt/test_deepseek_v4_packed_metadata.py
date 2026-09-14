@@ -82,3 +82,21 @@ def test_resolve_is_memoized_per_instance():
     md2 = jax.tree_util.tree_unflatten(treedef, leaves)
     assert md2.resolve() is not a1
     _assert_tree_equal(md2.resolve(), a1)
+
+
+def test_four_tree_pack_exposes_hca_view():
+    attention, tables = _trees()
+    kernel = {"cu": np.array([0, 2, 5], np.int32), "valid": np.array([1, 0, 1, 1], bool)}
+    init_slots = np.array([3, 17], np.int32)
+    packed, layout = pack_metadata(attention, tables, kernel, init_slots)
+    md = DeepseekV4RuntimeMetadata(
+        None, "sched", False, None, None, (), jnp.asarray(packed), layout
+    )
+    att, tabs = md.resolve()
+    _assert_tree_equal((attention, tables), (att, tuple(tabs)))
+    view = md.hca_metadata()
+    assert view.schedule == "sched" and view.use_uniform_prefill_fast_path is False
+    _assert_tree_equal(kernel, view.kernel)
+    np.testing.assert_array_equal(np.asarray(view.state_init_slots), init_slots)
+    # unpacked once per instance
+    assert md._unpacked() is md._unpacked()

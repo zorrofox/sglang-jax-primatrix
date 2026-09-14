@@ -90,6 +90,32 @@ class DeepseekV4RuntimeMetadata(DeepseekV4HCAMetadata):
     def has_metadata(self) -> bool:
         return self.packed is not None or (self.attention is not None and bool(self.read_tables))
 
+    def _unpacked(self):
+        """All packed trees, unpacked once per instance (== once per trace)."""
+        cached = self.__dict__.get("_unpacked_trees")
+        if cached is None:
+            cached = tuple(unpack_metadata(self.packed, self.layout))
+            self.__dict__["_unpacked_trees"] = cached
+        return cached
+
+    def hca_metadata(self):
+        """The HCA view ``(kernel, schedule, uniform, state_init_slots)`` of this step."""
+        from sgl_jax.srt.layers.attention.deepseek_v4_hca_backend import (
+            DeepseekV4HCAMetadata,
+        )
+
+        if self.packed is None or len(self._unpacked()) < 4:
+            return DeepseekV4HCAMetadata(
+                self.kernel,
+                self.schedule,
+                self.use_uniform_prefill_fast_path,
+                self.state_init_slots,
+            )
+        trees = self._unpacked()
+        return DeepseekV4HCAMetadata(
+            trees[2], self.schedule, self.use_uniform_prefill_fast_path, trees[3]
+        )
+
     def resolve(self):
         """``(attention, read_tables)`` whether or not the metadata is packed.
 
@@ -101,12 +127,8 @@ class DeepseekV4RuntimeMetadata(DeepseekV4HCAMetadata):
         """
         if self.packed is None:
             return self.attention, self.read_tables
-        cached = self.__dict__.get("_resolved")
-        if cached is None:
-            attention, tables = unpack_metadata(self.packed, self.layout)
-            cached = (attention, tuple(tables))
-            self.__dict__["_resolved"] = cached
-        return cached
+        trees = self._unpacked()
+        return trees[0], tuple(trees[1])
 
     def tree_flatten(self):
         return (
@@ -196,7 +218,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             raise RuntimeError("V4 runtime resources must be bound after pool initialization")
         hca = (
             self.hca.get_forward_metadata(
-                batch, request_pool=request_pool, allocator=allocator, fixed_bucket=True
+                batch,
+                request_pool=request_pool,
+                allocator=allocator,
+                fixed_bucket=True,
+                device=False,
             )
             if self.use_pallas_hca
             else DeepseekV4HCAMetadata()
@@ -311,12 +337,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             jax.tree.map(lambda *arrays: np.concatenate(arrays), *tables)
             for tables in tables_by_ratio.values()
         )
-        packed_host, layout = pack_metadata(host_attention, host_tables)
+        # The HCA kernel table (14 leaves) and the init slots ride in the same vector;
+        # `hca_metadata()` rebuilds the HCA view inside the jitted step.
+        packed_host, layout = pack_metadata(
+            host_attention, host_tables, hca.kernel, hca.state_init_slots
+        )
         return DeepseekV4RuntimeMetadata(
-            hca.kernel,
+            None,
             hca.schedule,
             hca.use_uniform_prefill_fast_path,
-            hca.state_init_slots,
+            None,
             None,
             (),
             jax.device_put(packed_host, sharding),
@@ -392,7 +422,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     else cache[:, cache.shape[-1] // 2 :]
                 ),
                 attention_sink=attention_sink,
-                metadata=self.forward_metadata,
+                metadata=self.forward_metadata.hca_metadata(),
             )
             return output.reshape(q.shape), {"state": state, "swa": window, "c128": history}
         md = self.forward_metadata

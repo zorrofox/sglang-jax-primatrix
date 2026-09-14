@@ -55,7 +55,10 @@ def resolve_csa_attention_backend() -> str:
     """``DSV4_CSA_ATTENTION=auto|sparse|dense`` (auto: sparse on TPU, dense elsewhere)."""
     mode = os.environ.get("DSV4_CSA_ATTENTION", "auto").lower()
     if mode == "auto":
-        return "sparse" if jax.default_backend() == "tpu" else "dense"
+        # The gathered kernels only pay off when the per-block selection union is far
+        # smaller than the candidate set; CSA's per-query top-512 over <=32K history
+        # is not that case (measured ~45x slower than dense at 8K), so auto == dense.
+        return "dense"
     if mode not in ("sparse", "dense"):
         raise ValueError(f"DSV4_CSA_ATTENTION must be auto|sparse|dense, got {mode!r}")
     return mode

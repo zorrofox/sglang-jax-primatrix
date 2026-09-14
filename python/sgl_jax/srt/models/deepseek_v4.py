@@ -977,6 +977,11 @@ class DeepseekV4Attention(nnx.Module):
         return output, updates
 
 
+def _use_mhc_seam() -> bool:
+    """``DSV4_MHC_SEAM=1``: fuse each sublayer's mHC post with the next sublayer's pre."""
+    return os.environ.get("DSV4_MHC_SEAM", "0") == "1"
+
+
 class DeepseekV4DecoderLayer(nnx.Module):
     def __init__(self, config, mesh, layer_id, dtype):
         from sgl_jax.srt.configs.deepseek_v4 import mhc_param_shapes
@@ -1034,6 +1039,62 @@ class DeepseekV4DecoderLayer(nnx.Module):
             compute, axes=self.mesh.axis_names, out_sharding=NamedSharding(self.mesh, spec)
         )
         return compute(output, residual, post, comb)
+
+    def _mhc_seam(self, output, residual, post, comb, fn, base, scale):
+        """post(output) fused with the next sublayer's pre: one kernel, streams stored once."""
+        stream_spec = P("data", None, None)
+        out_specs = (stream_spec, P("data", None), P("data", None), stream_spec)
+        compute = jax.shard_map(
+            self.mhc.seam,
+            mesh=None,
+            in_specs=(P("data", None), stream_spec, P("data", None), stream_spec, P(), P(), P()),
+            out_specs=out_specs,
+            check_vma=False,
+        )
+        compute = jax.sharding.auto_axes(
+            compute,
+            axes=self.mesh.axis_names,
+            out_sharding=tuple(NamedSharding(self.mesh, spec) for spec in out_specs),
+        )
+        return compute(output, residual, post, comb, fn, base, scale)
+
+    def attn_params(self):
+        return (self.hc_attn_fn.value, self.hc_attn_base.value, self.hc_attn_scale.value)
+
+    def call_seam(
+        self, streams, hidden, post, comb, next_params, batch, pools, rope_cache, rope_halves
+    ):
+        """Seam-fused layer step: ``(streams, hidden, post, comb)`` in and out.
+
+        ``hidden/post/comb`` are this layer's attention-side pre outputs (from the
+        previous seam or the model's first pre); ``next_params`` are the next layer's
+        attention hc params, or None for the last layer (plain post, hidden None).
+        """
+        attn, updates = self.self_attn(
+            self.attn_norm(hidden.astype(self.dtype)), batch, pools, rope_cache, rope_halves
+        )
+        streams, hidden, post, comb = self._mhc_seam(
+            attn,
+            streams,
+            post,
+            comb,
+            self.hc_ffn_fn.value,
+            self.hc_ffn_base.value,
+            self.hc_ffn_scale.value,
+        )
+        streams = streams.astype(self.dtype)
+        ffn, ids = self.mlp(
+            self.ffn_norm(hidden.astype(self.dtype)),
+            batch.input_ids,
+            token_valid_mask=batch.get_token_valid_mask(hidden.shape[0]),
+            dispatch_info=batch.expert_location_metadata,
+        )
+        if next_params is None:
+            streams = self._mhc_post(ffn, streams, post, comb).astype(self.dtype)
+            return streams, None, None, None, updates, ids
+        fn, base, scale = next_params
+        streams, hidden, post, comb = self._mhc_seam(ffn, streams, post, comb, fn, base, scale)
+        return streams.astype(self.dtype), hidden, post, comb, updates, ids
 
     def __call__(self, streams, batch, pools, rope_cache, rope_halves=None):
         hidden, post, comb = self._mhc_pre(
@@ -1119,6 +1180,10 @@ class DeepseekV4Model(nnx.Module):
             hidden = batch.input_embedding
         streams = expand_streams(hidden, self.mhc.hc_mult).astype(hidden.dtype)
         updates, ids = {}, []
+        seam = _use_mhc_seam() and self.mhc.backend == "pallas"
+        if seam:
+            first = self.layers[0]
+            hidden, post, comb = first._mhc_pre(streams, *first.attn_params())
         for i, layer in enumerate(self.layers):
             cache = self.rope_compressed if layer.self_attn.ratio else self.rope_plain
             halves = (
@@ -1126,7 +1191,13 @@ class DeepseekV4Model(nnx.Module):
                 if layer.self_attn.ratio
                 else None
             )
-            streams, updates[i], route_ids = layer(streams, batch, pools, cache.value, halves)
+            if seam:
+                nxt = self.layers[i + 1].attn_params() if i + 1 < len(self.layers) else None
+                streams, hidden, post, comb, updates[i], route_ids = layer.call_seam(
+                    streams, hidden, post, comb, nxt, batch, pools, cache.value, halves
+                )
+            else:
+                streams, updates[i], route_ids = layer(streams, batch, pools, cache.value, halves)
             ids.append(route_ids)
         hidden = self._collapse_head(streams)
         return (

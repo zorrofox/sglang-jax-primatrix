@@ -65,24 +65,60 @@ class CompilationManager:
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
-        # Optional context-length ladder (SGLANG_JAX_PRECOMPILE_CONTEXT_LADDER, comma
-        # separated tokens). Backends whose compiled shapes depend on the history length
-        # (DeepSeek-V4 read-table capacity buckets) get one precompile pass per rung;
-        # other backends ignore it. [None] keeps the stock single pass.
-        self.context_ladder = self._compute_context_ladder()
+        # Optional context-length ladder (SGLANG_JAX_PRECOMPILE_CONTEXT_LADDER: comma
+        # separated tokens, or "full" for every capacity bucket up to max_req_len).
+        # Backends whose compiled shapes depend on the history length (DeepSeek-V4
+        # read-table capacity buckets) get one precompile pass per rung; other backends
+        # ignore it. [None] keeps the stock single pass. Chunked prefill of one long
+        # request walks through every bucket below its final length, so a partial
+        # ladder still leaves one compile per uncovered bucket on the first request.
+        self.context_ladder = self._compute_context_ladder(max_req_len)
         self.cache_loc_buckets = self._compute_cache_loc_buckets()
         self._compiled_variants: set[tuple] = set()
         self._compiled_multimodal_extend_shapes: set[tuple[int, int]] = set()
 
     @staticmethod
-    def _compute_context_ladder() -> list[int | None]:
+    def _compute_context_ladder(max_context_len: int | None = None) -> list[int | None]:
         raw = os.environ.get("SGLANG_JAX_PRECOMPILE_CONTEXT_LADDER", "").strip()
         if not raw:
             return [None]
+        if raw.lower() == "full":
+            if not max_context_len or max_context_len <= 0:
+                raise ValueError("SGLANG_JAX_PRECOMPILE_CONTEXT_LADDER=full needs max_req_len")
+            return CompilationManager._full_context_ladder(max_context_len)
         rungs = sorted({int(x) for x in raw.split(",") if x.strip()})
         if any(r <= 0 for r in rungs):
             raise ValueError("SGLANG_JAX_PRECOMPILE_CONTEXT_LADDER entries must be positive")
         return list(rungs)
+
+    @staticmethod
+    def _full_context_ladder(max_context_len: int) -> list[int]:
+        """One rung per distinct capacity-bucket combination reachable below max_context_len.
+
+        Power-of-two context lengths from 512 upward each move the ratio-4 bucket; the
+        ratio-128 bucket only starts moving at 32K. The final rung is max_context_len
+        itself so the largest bucket is always covered.
+        """
+        from sgl_jax.srt.layers.attention.deepseek_v4_backend import (
+            precompile_capacities,
+        )
+
+        rungs: list[int] = []
+        seen: set[tuple[int, int]] = set()
+        ctx = 512
+        candidates = []
+        while ctx < max_context_len:
+            candidates.append(ctx)
+            ctx *= 2
+        candidates.append(max_context_len)
+        for ctx in candidates:
+            caps = precompile_capacities(ctx)
+            key = (caps[4], caps[128])
+            if key in seen:
+                continue
+            seen.add(key)
+            rungs.append(ctx)
+        return rungs
 
     @staticmethod
     def _set_precompile_context(model_runner, context_len: int | None) -> None:

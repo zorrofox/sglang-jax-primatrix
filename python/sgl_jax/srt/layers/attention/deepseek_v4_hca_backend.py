@@ -334,12 +334,15 @@ class DeepseekV4HCABackend(HCABackend):
             empty, mode="drop", out_sharding=scatter_sharding(self.mesh, 3)
         )
         if _flat_views():
-            # Flat row views: the kernels flatten to [rows, D] internally anyway, and the
-            # 4D views with tiny second-minor dims (2 / 1) cost a relayout copy of the
-            # whole buffer per layer per step on the way in and again on the way out.
-            state_view = state
+            # Flat window rows: the kernels flatten the window to [rows, D] anyway, and
+            # the (-1, page/2, 2, D) view costs a relayout copy of the whole buffer per
+            # layer per step on the way in and out. The state pool and the compressed
+            # cache keep their physical 4D layouts (the kernels validate those).
+            state_view = state.reshape(state.shape[0], 128, 2, self.head_dim)
             window_view = window.reshape(-1, self.head_dim)
-            compressed_view = compressed.reshape(-1, self.head_dim)
+            compressed_view = compressed.reshape(
+                compressed.shape[0], 1, self.page_size // 128, self.head_dim
+            )
         else:
             state_view = state.reshape(state.shape[0], 128, 2, self.head_dim)
             window_view = window.reshape(-1, self.page_size // 2, 2, self.head_dim)

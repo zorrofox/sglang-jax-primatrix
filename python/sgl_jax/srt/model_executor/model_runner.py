@@ -458,8 +458,37 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
             self.jitted_sampler = self._sampler_dispatcher
         else:
+            _seen_keys: set = set()
+
+            def _log_jit_key(forward_batch, logits_metadata):
+                # Debug aid (DSV4_LOG_JIT_KEY=1): log the jit cache signature of the
+                # dynamic args so precompile vs runtime keys can be diffed offline.
+                import hashlib
+
+                from jax._src.api_util import shaped_abstractify
+
+                leaves, treedef = jax.tree_util.tree_flatten((forward_batch, logits_metadata))
+                parts = []
+                for i, leaf in enumerate(leaves):
+                    try:
+                        a = shaped_abstractify(leaf)
+                        parts.append(f"{i}:{a.dtype}{tuple(a.shape)}w{int(a.weak_type)}")
+                    except Exception:
+                        parts.append(f"{i}:{type(leaf).__name__}")
+                sig = str(treedef) + "|" + ",".join(parts)
+                h = hashlib.md5(sig.encode()).hexdigest()[:10]
+                mode = getattr(forward_batch, "forward_mode", None)
+                if h not in _seen_keys:
+                    _seen_keys.add(h)
+                    logger.info(
+                        "JITKEY new %s mode=%s nleaves=%d sig=%s", h, mode, len(leaves), sig
+                    )
+                else:
+                    logger.info("JITKEY hit %s mode=%s", h, mode)
 
             def run_model_wrapper(forward_batch, logits_metadata):
+                if os.environ.get("DSV4_LOG_JIT_KEY"):
+                    _log_jit_key(forward_batch, logits_metadata)
                 return jitted_run_model(
                     model_def,
                     model_state_def,

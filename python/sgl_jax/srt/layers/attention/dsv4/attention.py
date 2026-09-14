@@ -247,6 +247,60 @@ def dsv4_attention(
     return jnp.where(jnp.asarray(valid_token_mask, bool)[:, None, None], out, 0.0)
 
 
+def csa_fused_attention(
+    q,
+    window_kv,
+    compressed_kv,
+    *,
+    query_positions,
+    query_request_ids,
+    valid_token_mask,
+    window_positions,
+    window_request_ids,
+    compressed_entry_ids,
+    compressed_request_ids,
+    attention_sink,
+    softmax_scale: float,
+    window_size: int,
+    ratio: int,
+    selected_entries=None,
+    interpret: bool = False,
+):
+    """`dsv4_attention` computed by the fused flash-style kernel.
+
+    Same admissibility as the dense path (`admissible_mask`, including the
+    indexer's top-k membership); the kernel streams key tiles with an online
+    softmax and skips tiles no query of the block may attend, instead of three
+    full passes over a ``[T, H, W+E]`` f32 score tensor.
+    """
+    from sgl_jax.srt.kernels.dsv4.csa_flash_attention import csa_flash_attention
+
+    q = jnp.asarray(q)
+    window_mask, compressed_mask = admissible_mask(
+        query_positions=query_positions,
+        query_request_ids=query_request_ids,
+        valid_token_mask=valid_token_mask,
+        window_positions=window_positions,
+        window_request_ids=window_request_ids,
+        compressed_entry_ids=compressed_entry_ids,
+        compressed_request_ids=compressed_request_ids,
+        window_size=window_size,
+        ratio=ratio,
+        selected_entries=selected_entries,
+    )
+    keys = jnp.concatenate((jnp.asarray(window_kv), jnp.asarray(compressed_kv)), axis=0)
+    mask = jnp.concatenate((window_mask, compressed_mask), axis=1)
+    out = csa_flash_attention(
+        q,
+        keys,
+        mask,
+        jnp.asarray(attention_sink, jnp.float32),
+        sm_scale=float(softmax_scale),
+        interpret=interpret,
+    )
+    return jnp.where(jnp.asarray(valid_token_mask, bool)[:, None, None], out, 0.0)
+
+
 def update_window_kv(window_kv, new_kv, write_loc, valid_mask):
     """Scatter this step's KV into the sliding-window cache.
 

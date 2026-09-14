@@ -39,6 +39,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.layers.attention.dsv4.attention import (
+    csa_fused_attention,
     csa_sparse_attention,
     dsv4_attention,
     update_window_kv,
@@ -52,15 +53,15 @@ from sgl_jax.srt.layers.attention.dsv4.indexer import (
 
 
 def resolve_csa_attention_backend() -> str:
-    """``DSV4_CSA_ATTENTION=auto|sparse|dense`` (auto: sparse on TPU, dense elsewhere)."""
+    """``DSV4_CSA_ATTENTION=auto|sparse|dense|fused`` (auto == dense; fused = Pallas flash kernel)."""
     mode = os.environ.get("DSV4_CSA_ATTENTION", "auto").lower()
     if mode == "auto":
         # The gathered kernels only pay off when the per-block selection union is far
         # smaller than the candidate set; CSA's per-query top-512 over <=32K history
         # is not that case (measured ~45x slower than dense at 8K), so auto == dense.
         return "dense"
-    if mode not in ("sparse", "dense"):
-        raise ValueError(f"DSV4_CSA_ATTENTION must be auto|sparse|dense, got {mode!r}")
+    if mode not in ("sparse", "dense", "fused"):
+        raise ValueError(f"DSV4_CSA_ATTENTION must be auto|sparse|dense|fused, got {mode!r}")
     return mode
 
 
@@ -364,11 +365,13 @@ def run_layer(
         )
         return out, updates
     window_kv = jnp.take(updates["swa"], jnp.asarray(tables.window_rows), axis=0)
-    attend = (
-        csa_sparse_attention
-        if selected is not None and resolve_csa_attention_backend() == "sparse"
-        else dsv4_attention
-    )
+    backend = resolve_csa_attention_backend()
+    if selected is not None and backend == "sparse":
+        attend = csa_sparse_attention
+    elif backend == "fused":
+        attend = csa_fused_attention
+    else:
+        attend = dsv4_attention
     out = attend(
         q,
         window_kv,

@@ -51,6 +51,9 @@ from sgl_jax.srt.layers.attention.dsv4.indexer import (
     resolve_indexer_backend,
 )
 
+# Token count from which the fused CSA kernel replaces the XLA dense path.
+_FUSED_MIN_TOKENS = int(os.environ.get("DSV4_CSA_FUSED_MIN_TOKENS", "64"))
+
 
 def resolve_csa_attention_backend() -> str:
     """``DSV4_CSA_ATTENTION=auto|sparse|dense|fused`` (auto == dense; fused = Pallas flash kernel)."""
@@ -368,7 +371,10 @@ def run_layer(
     backend = resolve_csa_attention_backend()
     if selected is not None and backend == "sparse":
         attend = csa_sparse_attention
-    elif backend == "fused":
+    elif backend == "fused" and q.shape[0] >= _FUSED_MIN_TOKENS:
+        # Measured on v7x: the flash kernel wins on prefill chunks (8K TTFT -64 ms)
+        # but costs +0.3 ms/step on decode buckets (T <= 16), where the XLA dense
+        # path over a few hundred keys is cheaper than a pallas_call per layer.
         attend = csa_fused_attention
     else:
         attend = dsv4_attention

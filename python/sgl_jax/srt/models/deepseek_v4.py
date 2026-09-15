@@ -977,6 +977,9 @@ class DeepseekV4Attention(nnx.Module):
         return output, updates
 
 
+_MHC_SEAM_MIN_TOKENS = int(os.environ.get("DSV4_MHC_SEAM_MIN_TOKENS", "64"))
+
+
 def _use_mhc_seam() -> bool:
     """``DSV4_MHC_SEAM=1``: fuse each sublayer's mHC post with the next sublayer's pre."""
     return os.environ.get("DSV4_MHC_SEAM", "0") == "1"
@@ -1180,7 +1183,13 @@ class DeepseekV4Model(nnx.Module):
             hidden = batch.input_embedding
         streams = expand_streams(hidden, self.mhc.hc_mult).astype(hidden.dtype)
         updates, ids = {}, []
-        seam = _use_mhc_seam() and self.mhc.backend == "pallas"
+        # The seam pays on prefill chunks (8K TTFT -10 ms, 32K -20 ms) and costs
+        # +0.4 ms/step on decode buckets, so it is gated on the token count.
+        seam = (
+            _use_mhc_seam()
+            and self.mhc.backend == "pallas"
+            and streams.shape[0] >= _MHC_SEAM_MIN_TOKENS
+        )
         if seam:
             first = self.layers[0]
             hidden, post, comb = first._mhc_pre(streams, *first.attn_params())

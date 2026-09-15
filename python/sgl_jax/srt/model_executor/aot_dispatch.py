@@ -34,12 +34,15 @@ import logging
 import os
 
 import jax
+import numpy as np
 from jax._src.lib import xla_client as _xc
 
 logger = logging.getLogger(__name__)
 
 _ENV = os.environ.get("SGLANG_JAX_AOT_DISPATCH", "0")
 _AUTO_MIN_ARGS = 512
+# Batch the per-step numpy leaves into one device_put before shard_args.
+_BATCH_PUT = os.environ.get("SGLANG_JAX_AOT_BATCH_PUT", "1") != "0"
 
 _FALLBACK = object()
 
@@ -140,9 +143,18 @@ class AotDispatcher:
         ) = entry
         from jax._src.interpreters import pxla
 
-        dyn_bufs = pxla.shard_args(
-            dyn_shardings, dyn_layouts, dyn_copy, [dyn_leaves[i] for i in dyn_kept]
-        )
+        kept = [dyn_leaves[i] for i in dyn_kept]
+        if _BATCH_PUT:
+            # Host arrays reach the device one transfer per leaf inside shard_args
+            # (~40 us each; V4 has ~170 dynamic leaves per step). Ship every numpy
+            # leaf in one batched device_put first, so shard_args only sees device
+            # arrays.
+            np_pos = [j for j, a in enumerate(kept) if isinstance(a, np.ndarray)]
+            if np_pos:
+                put = jax.device_put([kept[j] for j in np_pos], [dyn_shardings[j] for j in np_pos])
+                for j, arr in zip(np_pos, put):
+                    kept[j] = arr
+        dyn_bufs = pxla.shard_args(dyn_shardings, dyn_layouts, dyn_copy, kept)
         results = xla_exec.execute_sharded(static_bufs + list(dyn_bufs))
         out_flat = results.consume_with_handlers(out_handlers)
         return jax.tree_util.tree_unflatten(out_tree, out_flat)
@@ -207,11 +219,14 @@ class AotDispatcher:
             layouts[n_static:],
             [_xc.ArrayCopySemantics.REUSE_INPUT] * len(dyn_kept),
         )
+        first_leaves = jax.tree_util.tree_leaves(dyn_args)
+        n_np = sum(1 for i in dyn_kept if isinstance(first_leaves[i - n_stable], np.ndarray))
         logger.info(
-            "[aot-dispatch:%s] compiled shape key (%d stable + %d dyn kept args)",
+            "[aot-dispatch:%s] compiled shape key (%d stable + %d dyn kept args, %d numpy)",
             self._name,
             n_static,
             len(dyn_kept),
+            n_np,
         )
         # First call goes through the checked path: validates that every
         # input's sharding/layout matches what the executable expects.

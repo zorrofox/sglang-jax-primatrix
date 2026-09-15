@@ -206,6 +206,23 @@ def validate_dflash_request(req) -> str | None:
     return None
 
 
+class _IterStats:
+    """Rolling per-iteration host timing, logged every ``every`` samples (no profiler)."""
+
+    def __init__(self, name: str, every: int = 200):
+        self.name, self.every, self.n = name, every, 0
+        self.sums: dict[str, float] = {}
+
+    def add(self, **ms):
+        for k, v in ms.items():
+            self.sums[k] = self.sums.get(k, 0.0) + v
+        self.n += 1
+        if self.n >= self.every:
+            parts = " ".join(f"{k}={v / self.n:.2f}ms" for k, v in self.sums.items())
+            logger.info("[iter-trace:%s] n=%d %s", self.name, self.n, parts)
+            self.n, self.sums = 0, {}
+
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerProfilerMixin,
@@ -1176,6 +1193,9 @@ class Scheduler(
         """A scheduler loop that overlaps the CPU processing and Accelerator computation."""
         self.result_queue = deque()
         _pd_iter_trace = self.pd == "pathways" and os.environ.get("SGLANG_PD_DBG")
+        # SGLANG_JAX_ITER_TRACE=1: rolling per-iteration host timing (no profiler),
+        # logged every 200 decode iterations: recv / get_batch / run_batch / process.
+        _iter_stats = _IterStats("scheduler") if os.environ.get("SGLANG_JAX_ITER_TRACE") else None
 
         if self.pd == "pathways":
             import gc as _gc
@@ -1190,7 +1210,7 @@ class Scheduler(
             )
 
         while True:
-            _it0 = time.perf_counter() if _pd_iter_trace else 0.0
+            _it0 = time.perf_counter() if (_pd_iter_trace or _iter_stats) else 0.0
             recv_reqs = (
                 self._comm_backend.recv_requests()
                 if self._comm_backend is not None
@@ -1199,7 +1219,7 @@ class Scheduler(
             # Assign DP rank to incoming requests
             recv_reqs = self.select_dp_for_request(recv_reqs)
             self.process_input_requests(recv_reqs)
-            _it1 = time.perf_counter() if _pd_iter_trace else 0.0
+            _it1 = time.perf_counter() if (_pd_iter_trace or _iter_stats) else 0.0
 
             # Skip batch processing when engine is paused
             if self._engine_paused:
@@ -1207,7 +1227,7 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
-            _it2 = time.perf_counter() if _pd_iter_trace else 0.0
+            _it2 = time.perf_counter() if (_pd_iter_trace or _iter_stats) else 0.0
 
             # HiCache: stage_load was issued during last round; flush must wait
             # for that forward's replace_all to avoid racing the donated kv_buffer.
@@ -1219,6 +1239,7 @@ class Scheduler(
                     self.last_batch.launch_done.wait()
                 self._flush_pending_h2d()
 
+            _rb0 = time.perf_counter() if _iter_stats else 0.0
             if batch:
                 batch.launch_done = threading.Event()
                 with jax.profiler.TraceAnnotation("run_batch"):
@@ -1246,6 +1267,7 @@ class Scheduler(
                     with jax.profiler.TraceAnnotation("process_batch_result"):
                         self.process_batch_result(tmp_batch, None, batch.launch_done)
 
+            _rb1 = time.perf_counter() if _iter_stats else 0.0
             if self.last_batch:
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
@@ -1260,6 +1282,15 @@ class Scheduler(
                 self.on_idle()
 
             self.last_batch = batch
+            if _iter_stats and batch is not None and batch.forward_mode.is_decode():
+                _it3 = time.perf_counter()
+                _iter_stats.add(
+                    total=(_it3 - _it0) * 1e3,
+                    recv=(_it1 - _it0) * 1e3,
+                    get_batch=(_it2 - _it1) * 1e3,
+                    run_batch=(_rb1 - _rb0) * 1e3,
+                    process=(_it3 - _rb1) * 1e3,
+                )
             if _pd_iter_trace:
                 _it3 = time.perf_counter()
                 if _it3 - _it0 > 0.5:

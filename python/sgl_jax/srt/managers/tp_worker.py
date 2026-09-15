@@ -4,6 +4,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from queue import Queue
 
 import jax
@@ -30,6 +31,23 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+class _WorkerIterStats:
+    def __init__(self, every: int = 200):
+        self.every, self.n, self.sums = every, 0, {}
+
+    def add(self, **ms):
+        for k, v in ms.items():
+            self.sums[k] = self.sums.get(k, 0.0) + v
+        self.n += 1
+        if self.n >= self.every:
+            parts = " ".join(f"{k}={v / self.n:.2f}ms" for k, v in self.sums.items())
+            logger.info("[iter-trace:worker] n=%d %s", self.n, parts)
+            self.n, self.sums = 0, {}
+
+
+_WORKER_STATS = _WorkerIterStats() if os.environ.get("SGLANG_JAX_ITER_TRACE") else None
 
 
 def _iter_padded_input_logprob_reqs(model_worker_batch, padded_rows: int):
@@ -490,8 +508,10 @@ class ModelWorker:
         else:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
+        _t0 = time.perf_counter() if _WORKER_STATS else 0.0
         if forward_metadata is None:
             forward_metadata = self.model_runner.get_attention_metadata(model_worker_batch)
+        _t1 = time.perf_counter() if _WORKER_STATS else 0.0
 
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
@@ -534,6 +554,12 @@ class ModelWorker:
             forward_batch,
             logits_metadata=logits_metadata,
         )
+        if _WORKER_STATS and model_worker_batch.forward_mode.is_decode():
+            _t2 = time.perf_counter()
+            _WORKER_STATS.add(
+                metadata=(_t1 - _t0) * 1e3,
+                sampling_meta_and_forward_dispatch=(_t2 - _t1) * 1e3,
+            )
 
         self.dump_topk_ids(layers_topk_ids, model_worker_batch)
 

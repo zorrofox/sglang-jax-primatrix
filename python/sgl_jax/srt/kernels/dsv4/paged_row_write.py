@@ -47,7 +47,11 @@ def _kernel(dst_ref, loc_ref, valid_ref, values_ref, _, cache_hbm_ref, tile_ref,
                 )
                 load.start()
                 load.wait()
-                tile_ref[pl.ds(loc - tile_start, 1), :] = values_ref[pl.ds(r, 1), :]
+                # Masked whole-tile select instead of a dynamic single-row store:
+                # Mosaic cannot prove a dynamic sublane offset aligned for packed bf16.
+                row_ids = jax.lax.broadcasted_iota(jnp.int32, (_TILE, tile_ref.shape[1]), 0)
+                new_row = jnp.broadcast_to(values_ref[pl.ds(r, 1), :], (_TILE, tile_ref.shape[1]))
+                tile_ref[...] = jnp.where(row_ids == (loc - tile_start), new_row, tile_ref[...])
                 store = pltpu.make_async_copy(
                     tile_ref, cache_hbm_ref.at[pl.ds(tile_start, _TILE)], sem
                 )

@@ -209,20 +209,27 @@ def mhc_seam_fused(
     new_res, mixes, sqrsum, layer2d = (a[:n] for a in (new_res, mixes, sqrsum, layer2d))
 
     # Gates for the next post (the pre gate was consumed in-kernel). Same rule as
-    # pre: the RMS scale multiplies the projection. The Sinkhorn runs in the
-    # existing gates kernel; in XLA it was ~85 ops per seam.
-    from sgl_jax.srt.kernels.mhc.mhc import mhc_gates
-
+    # pre: the RMS scale multiplies the projection. On TPU the Sinkhorn runs in the
+    # existing gates kernel (in XLA it was ~85 ops per seam); interpret mode (CPU
+    # tests) has no device schedule and uses the reference.
     scaled = mixes * jax.lax.rsqrt(sqrsum / (hc * hidden) + norm_eps)
-    post_next, comb_next = mhc_gates(
-        scaled,
-        jnp.asarray(scale_next, jnp.float32),
-        jnp.asarray(base_next, jnp.float32),
-        hc_mult=hc,
-        sinkhorn_iters=sinkhorn_iters,
-        eps=hc_eps,
-        interpret=interpret or None,
-    )
+    if interpret:
+        from sgl_jax.srt.layers.deepseek_v4_mhc import mhc_gates_reference
+
+        _, post_next, comb_next = mhc_gates_reference(
+            scaled, scale_next, base_next, hc_mult=hc, sinkhorn_iters=sinkhorn_iters, eps=hc_eps
+        )
+    else:
+        from sgl_jax.srt.kernels.mhc.mhc import mhc_gates
+
+        post_next, comb_next = mhc_gates(
+            scaled,
+            jnp.asarray(scale_next, jnp.float32),
+            jnp.asarray(base_next, jnp.float32),
+            hc_mult=hc,
+            sinkhorn_iters=sinkhorn_iters,
+            eps=hc_eps,
+        )
     return (
         new_res.reshape(*outer, hc, hidden),
         layer2d.reshape(*outer, hidden),

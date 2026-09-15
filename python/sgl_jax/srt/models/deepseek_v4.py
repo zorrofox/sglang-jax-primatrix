@@ -637,7 +637,9 @@ class DeepseekV4MoE(nnx.Module):
         if self.is_hash_layer:
             valid = valid & (input_ids >= 0) & (input_ids < self.vocab_size)
         hidden_states = jnp.where(valid[:, None], hidden_states, 0)
-        if _use_fused_moe(self.experts):
+        if _use_fused_moe(self.experts) and hidden_states.shape[0] >= _FUSED_MOE_MIN_TOKENS:
+            # Auto-tuned v7x blocks: the fused kernel is -17% per layer on 8K prefill
+            # chunks but +35% on decode buckets (~90 us fixed cost per call).
             output = self._fused_experts(hidden_states, weights, ids, out_sharding)
         else:
             output = self.experts(hidden_states, weights, ids, out_sharding=out_sharding)
@@ -703,6 +705,9 @@ def _checkpoint_matrix(linear):
         scale = jnp.repeat(linear.weight_scale.value[:, 0, :], 128, axis=0).T
         return weight * scale
     return linear.weight.value.T
+
+
+_FUSED_MOE_MIN_TOKENS = int(os.environ.get("DSV4_FUSED_MOE_MIN_TOKENS", "256"))
 
 
 def _use_fused_moe(experts) -> bool:

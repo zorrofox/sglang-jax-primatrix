@@ -53,6 +53,10 @@ _MEMBERSHIP_FUSED_BUDGET = int(os.environ.get("DSV4_MEMBERSHIP_FUSED_BUDGET", 1 
 # compare, "scatter" a per-row scatter. On v7x the fused path was 16% of an 8K prefill
 # chunk (137 ms of 835) because its work grows as T*K*E; packing cuts that 32x.
 _MEMBERSHIP_MODE = os.environ.get("DSV4_MEMBERSHIP", "packed")
+# ``DSV4_PAGED_KV_WRITE=1``: prefill-sized window KV writes go through the page-run
+# DMA writer instead of an XLA scatter (decode buckets keep the scatter).
+_PAGED_KV_WRITE = os.environ.get("DSV4_PAGED_KV_WRITE", "0") == "1"
+_PAGED_KV_WRITE_MIN_TOKENS = int(os.environ.get("DSV4_PAGED_KV_WRITE_MIN_TOKENS", "256"))
 # Queries per program on the sparse CSA path (the block's selected-unit union is fetched once).
 _CSA_SPARSE_QUERY_BLOCK = int(os.environ.get("DSV4_CSA_SPARSE_QUERY_BLOCK", 0))  # 0 = auto
 
@@ -319,6 +323,12 @@ def update_window_kv(window_kv, new_kv, write_loc, valid_mask):
     new_kv = jnp.asarray(new_kv, window_kv.dtype)
     loc = jnp.asarray(write_loc)
     keep = jnp.asarray(valid_mask, bool) & (loc >= 0) & (loc < window_kv.shape[0])
+    if _PAGED_KV_WRITE and new_kv.shape[0] >= _PAGED_KV_WRITE_MIN_TOKENS and window_kv.ndim == 2:
+        # Prefill chunks write thousands of page-contiguous rows; XLA's scatter does
+        # them one row at a time (1.2 ms per layer for 8K on v7x).
+        from sgl_jax.srt.kernels.dsv4.paged_row_write import paged_row_write
+
+        return paged_row_write(window_kv, new_kv, loc, keep)
     loc = jnp.where(keep, loc, window_kv.shape[0])
     return window_kv.at[loc].set(new_kv, mode="drop")
 

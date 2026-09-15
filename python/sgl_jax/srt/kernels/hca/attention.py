@@ -155,6 +155,46 @@ def _scatter_physical_rows(flat_cache, locations, values, valid, *, max_rows=Non
     return update.set(padded, **kwargs)
 
 
+def _paged_kv_write_enabled(tokens: int) -> bool:
+    return os.environ.get("DSV4_PAGED_KV_WRITE", "0") == "1" and tokens >= int(
+        os.environ.get("DSV4_PAGED_KV_WRITE_MIN_TOKENS", "256")
+    )
+
+
+def _pad_queries(new_kv, query_seq_ids, local_queries, valid_token_mask, *, batch, max_queries):
+    """``[B, max_queries, D]`` with each request's chunk rows at its local query index.
+
+    Each request's rows are contiguous in ``new_kv`` and in the destination, so on
+    prefill chunks the page-run DMA writer replaces the row-at-a-time XLA scatter
+    (1.15 ms per layer for an 8K chunk on v7x).
+    """
+    tokens, head_dim = new_kv.shape
+    if _paged_kv_write_enabled(tokens):
+        from sgl_jax.srt.kernels.dsv4.paged_row_write import paged_row_write
+
+        flat_dst = query_seq_ids.astype(jnp.int32) * max_queries + local_queries.astype(jnp.int32)
+        keep = (
+            jnp.asarray(valid_token_mask, bool)
+            & (local_queries >= 0)
+            & (local_queries < max_queries)
+            & (query_seq_ids >= 0)
+            & (query_seq_ids < batch)
+        )
+        flat = paged_row_write(
+            jnp.zeros((batch * max_queries, head_dim), new_kv.dtype),
+            new_kv,
+            flat_dst,
+            keep,
+            interpret=_get_interpret(),
+        )
+        return flat.reshape(batch, max_queries, head_dim)
+    return (
+        jnp.zeros((batch, max_queries, head_dim), new_kv.dtype)
+        .at[query_seq_ids, local_queries]
+        .set(new_kv)
+    )
+
+
 def _commit_window_rows(
     window_flat,
     window_page_indices,
@@ -1268,10 +1308,8 @@ def ragged_attention(
     history = _gather_physical_rows(window_flat, history_locs, history_valid, head_dim)
 
     local_queries = jnp.arange(tokens, dtype=jnp.int32) - cu_q_lens[query_seq_ids]
-    kv_padded = (
-        jnp.zeros((batch, max_queries, head_dim), new_kv.dtype)
-        .at[query_seq_ids, local_queries]
-        .set(new_kv)
+    kv_padded = _pad_queries(
+        new_kv, query_seq_ids, local_queries, valid_token_mask, batch=batch, max_queries=max_queries
     )
     combined_kv = jnp.concatenate((history, kv_padded), axis=1)
     if query_block_request_ids.shape[0]:

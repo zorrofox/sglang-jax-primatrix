@@ -28,7 +28,8 @@ def _kernel(dst_ref, loc_ref, valid_ref, values_ref, _, cache_hbm_ref, tile_ref,
 
     @pl.when(dst >= 0)
     def _contiguous():
-        copy = pltpu.make_async_copy(values_ref, cache_hbm_ref.at[pl.ds(dst, run)], sem)
+        start = pl.multiple_of(dst, _TILE)  # the wrapper only marks tile-aligned runs
+        copy = pltpu.make_async_copy(values_ref, cache_hbm_ref.at[pl.ds(start, run)], sem)
         copy.start()
         copy.wait()
 

@@ -455,6 +455,7 @@ class EPMoE(nnx.Module):
         topk_ids,
         *,
         out_sharding: jax.sharding.NamedSharding | None = None,
+        return_partials: bool = False,
     ) -> jax.Array:
         if self.replicate_experts:
             if out_sharding is None:
@@ -467,7 +468,10 @@ class EPMoE(nnx.Module):
                 topk_weights,
                 topk_ids,
                 out_sharding=out_sharding,
+                return_partials=return_partials,
             )
+        if return_partials:
+            raise NotImplementedError("return_partials is only supported for replicated experts")
 
         if out_sharding is None:
             out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * hidden_states.ndim)))
@@ -556,6 +560,7 @@ class EPMoE(nnx.Module):
         topk_ids,
         *,
         out_sharding: jax.sharding.NamedSharding,
+        return_partials: bool = False,
     ) -> jax.Array:
         token_spec = P("data", *([None] * (hidden_states.ndim - 1)))
         routing_spec = P("data", *([None] * (topk_ids.ndim - 1)))
@@ -567,13 +572,22 @@ class EPMoE(nnx.Module):
                 "replicated EPMoE output must shard the token dimension over the data axis"
             )
         scatter_on_tensor = "tensor" in token_axes
+        if return_partials:
+            # Skip the in-kernel psum: each device returns its partial [1, T, D] and
+            # the caller reduces once (e.g. together with the shared experts).
+            scatter_on_tensor = False
+            out_spec = P("tensor", *token_spec)
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             hidden_states = jax.sharding.reshard(hidden_states, token_spec)
             topk_weights = jax.sharding.reshard(topk_weights, routing_spec)
             topk_ids = jax.sharding.reshard(topk_ids, routing_spec)
             result = shard_map(
-                partial(self._forward, scatter_on_tensor=scatter_on_tensor),
+                partial(
+                    self._forward,
+                    scatter_on_tensor=scatter_on_tensor,
+                    return_partials=return_partials,
+                ),
                 mesh=self.moe_mesh,
                 in_specs=(
                     token_spec,
@@ -594,6 +608,8 @@ class EPMoE(nnx.Module):
                 self.wo[...],
             )
 
+        if return_partials:
+            return result
         return jax.sharding.reshard(result, out_sharding)
 
     def _forward(
@@ -612,6 +628,7 @@ class EPMoE(nnx.Module):
         wo_kernel_bias=None,
         *,
         scatter_on_tensor: bool = False,
+        return_partials: bool = False,
     ):
         expert_shard_id = (
             jnp.array(0, dtype=jnp.int32)
@@ -652,6 +669,8 @@ class EPMoE(nnx.Module):
         # Reduce on the "tensor" axis. RS (psum_scatter) when caller asked
         # for SP layout on the token dim, AR (psum) otherwise. The matching
         # out_specs is set in __call__ from the same source of truth.
+        if return_partials:
+            return output[None]
         if self.tp_size > 1:
             if scatter_on_tensor:
                 output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=0, tiled=True)

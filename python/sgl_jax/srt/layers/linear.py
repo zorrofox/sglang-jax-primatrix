@@ -443,6 +443,7 @@ class QuantizedLinear(nnx.Module):
         x: jax.Array,
         *,
         out_sharding: jax.sharding.Sharding | None = None,
+        return_partials: bool = False,
     ) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass using quantized matmul. If ``out_sharding`` is None,
         falls back to standard TP layout derived from ``kernel_axes``.
@@ -493,6 +494,35 @@ class QuantizedLinear(nnx.Module):
 
         target = out_sharding or NamedSharding(self.mesh, P("data", output_axis))
         output_partition_dim = _shard_map_output_partition_dim(target, input_axis)
+
+        if return_partials:
+            # Row-parallel projection without its all-reduce: each device returns its
+            # partial as [1, T, N] (leading axis = the contracted mesh axis) so the
+            # caller can sum several partials and reduce once.
+            if input_axis is None or self.bias is not None:
+                raise ValueError("return_partials needs a row-parallel, bias-free projection")
+            local = partial(
+                xla_quantized_matmul_local,
+                quantize_activation=quantize_activation,
+                reduce_axis=None,
+                compute_dtype=self.compute_dtype,
+                weight_block_size=self.weight_block_size,
+                activation_quant_dtype=self.activation_dtype,
+                allow_narrow_n_blockwise=self.allow_narrow_n_blockwise,
+                output_scatter_dimension=None,
+            )
+            partials = shard_map(
+                lambda a, w, sc: local(a, w, sc)[None],
+                mesh=self.mesh,
+                in_specs=in_specs,
+                out_specs=P(input_axis, "data", output_axis),
+                check_vma=False,
+            )(x_2d, self.weight_q.value, scale_val)
+            if x.ndim > 2:
+                partials = partials.reshape(
+                    (partials.shape[0],) + x.shape[:-1] + (partials.shape[-1],)
+                )
+            return partials, None
 
         output = shard_map(
             partial(

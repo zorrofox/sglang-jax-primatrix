@@ -361,7 +361,7 @@ class DeepseekV4SharedMLP(nnx.Module):
                 ),
             )
 
-    def __call__(self, hidden_states):
+    def __call__(self, hidden_states, *, return_partials: bool = False):
         gate, _ = self.gate_proj(hidden_states)
         up, _ = self.up_proj(hidden_states)
         activated = (
@@ -369,6 +369,9 @@ class DeepseekV4SharedMLP(nnx.Module):
             if self.swiglu_limit is None
             else silu_and_mul_with_clamp(gate, up, self.swiglu_limit)
         )
+        if return_partials:
+            output, _ = self.down_proj(activated, return_partials=True)
+            return output
         output, _ = self.down_proj(activated)
         return output
 
@@ -637,6 +640,24 @@ class DeepseekV4MoE(nnx.Module):
         if self.is_hash_layer:
             valid = valid & (input_ids >= 0) & (input_ids < self.vocab_size)
         hidden_states = jnp.where(valid[:, None], hidden_states, 0)
+        if (
+            _MERGE_MOE_REDUCE
+            and self.shared_experts is not None
+            and getattr(self.experts, "replicate_experts", False)
+            and hasattr(self.shared_experts.down_proj, "weight_q")
+            and not (
+                _use_fused_moe(self.experts) and hidden_states.shape[0] >= _FUSED_MOE_MIN_TOKENS
+            )
+        ):
+            # One all-reduce per MoE layer instead of two: routed experts and the
+            # shared experts' down projection each hand back per-device partials
+            # [tp, T, D]; add locally, reduce once (a 10 us ICI op per layer saved).
+            routed = self.experts(hidden_states, weights, ids, return_partials=True)
+            shared = self.shared_experts(hidden_states, return_partials=True)
+            output = jnp.sum(routed + shared, axis=0)
+            if out_sharding is not None:
+                output = jax.sharding.reshard(output, out_sharding)
+            return jnp.where(valid[:, None], output, 0), ids
         if _use_fused_moe(self.experts) and hidden_states.shape[0] >= _FUSED_MOE_MIN_TOKENS:
             # Auto-tuned v7x blocks: the fused kernel is -17% per layer on 8K prefill
             # chunks but +35% on decode buckets (~90 us fixed cost per call).
@@ -708,6 +729,8 @@ def _checkpoint_matrix(linear):
 
 
 _FUSED_MOE_MIN_TOKENS = int(os.environ.get("DSV4_FUSED_MOE_MIN_TOKENS", "256"))
+# ``DSV4_MERGE_MOE_REDUCE=1``: merge the routed and shared-expert all-reduces per layer.
+_MERGE_MOE_REDUCE = os.environ.get("DSV4_MERGE_MOE_REDUCE", "0") == "1"
 
 
 def _use_fused_moe(experts) -> bool:

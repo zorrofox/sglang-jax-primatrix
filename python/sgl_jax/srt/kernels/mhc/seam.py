@@ -27,6 +27,7 @@ to bf16 before the GEMM exactly where the unfused path stores them.
 from __future__ import annotations
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -125,7 +126,7 @@ def mhc_seam_fused(
     sinkhorn_iters: int,
     norm_eps: float,
     hc_eps: float,
-    token_block_size: int = 32,
+    token_block_size: int | None = None,
     interpret: bool = False,
 ):
     """``post(y, streams, post_gate, comb)`` then ``pre(new_streams, fn_next, ...)``.
@@ -133,8 +134,6 @@ def mhc_seam_fused(
     Returns ``(new_streams [..., hc, d] bf16, layer_input [..., d] bf16,
     post_gate_next [..., hc], comb_next [..., hc, hc])``.
     """
-    from sgl_jax.srt.layers.deepseek_v4_mhc import mhc_gates_reference
-
     residual_streams = jnp.asarray(residual_streams)
     outer = residual_streams.shape[:-2]
     hc, hidden = residual_streams.shape[-2:]
@@ -147,8 +146,11 @@ def mhc_seam_fused(
     fn = jnp.asarray(fn_next, jnp.float32)
     hc3 = fn.shape[0]
     n = x2d.shape[0]
+    if token_block_size is None:
+        token_block_size = int(os.environ.get("DSV4_MHC_SEAM_BLOCK", "64"))
 
-    tb = min(token_block_size, _round_up(n, _SUBLANE))
+    # Whole-extent blocks for small token counts (decode buckets): no pad/slice ops.
+    tb = n if n <= token_block_size else token_block_size
     n_pad = _round_up(n, tb)
     pad = n_pad - n
     if pad:
@@ -206,11 +208,20 @@ def mhc_seam_fused(
     )(x2d, res2d, post2d, comb2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
     new_res, mixes, sqrsum, layer2d = (a[:n] for a in (new_res, mixes, sqrsum, layer2d))
 
-    # Gates for the next post (pre gate was consumed in-kernel). Same rule as pre:
-    # the RMS scale multiplies the projection.
+    # Gates for the next post (the pre gate was consumed in-kernel). Same rule as
+    # pre: the RMS scale multiplies the projection. The Sinkhorn runs in the
+    # existing gates kernel; in XLA it was ~85 ops per seam.
+    from sgl_jax.srt.kernels.mhc.mhc import mhc_gates
+
     scaled = mixes * jax.lax.rsqrt(sqrsum / (hc * hidden) + norm_eps)
-    _, post_next, comb_next = mhc_gates_reference(
-        scaled, scale_next, base_next, hc_mult=hc, sinkhorn_iters=sinkhorn_iters, eps=hc_eps
+    post_next, comb_next = mhc_gates(
+        scaled,
+        jnp.asarray(scale_next, jnp.float32),
+        jnp.asarray(base_next, jnp.float32),
+        hc_mult=hc,
+        sinkhorn_iters=sinkhorn_iters,
+        eps=hc_eps,
+        interpret=interpret or None,
     )
     return (
         new_res.reshape(*outer, hc, hidden),

@@ -154,14 +154,44 @@ def project_tokens(x, wkv, wgate, ape, positions, *, ratio: int):
         raise ValueError(
             f"ape must be [ratio, coff*D] = [{ratio}, {coff_width}], got {jnp.asarray(ape).shape}"
         )
-    kv = jnp.einsum(
-        "th,oh->to", x, jnp.asarray(wkv, jnp.float32), precision=jax.lax.Precision.HIGHEST
-    )
-    score = jnp.einsum(
-        "th,oh->to", x, jnp.asarray(wgate, jnp.float32), precision=jax.lax.Precision.HIGHEST
-    )
+    kv = _project(x, wkv)
+    score = _project(x, wgate)
     score = score + jnp.asarray(ape, jnp.float32)[jnp.asarray(positions) % ratio]
     return kv, score
+
+
+_FAST_PROJ = os.environ.get("DSV4_COMPRESSOR_FAST_PROJ", "0") == "1"
+
+
+def _project(x, w):
+    """``x @ w.T`` in f32 with f32-exact products.
+
+    The reference uses ``Precision.HIGHEST`` (a 6-pass bf16 emulation of f32 on the
+    MXU). The activations reaching the compressor are bf16 values, so when the
+    weight is bf16 too one bf16 pass with f32 accumulation gives the same products
+    exactly, and an f32 weight is reproduced to rounding by three bf16 passes over
+    its hi/mid/lo split (``DSV4_COMPRESSOR_FAST_PROJ=1``; default keeps HIGHEST).
+    """
+    w = jnp.asarray(w)
+    if not _FAST_PROJ:
+        return jnp.einsum(
+            "th,oh->to", x, w.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST
+        )
+    x_bf = x.astype(jnp.bfloat16)
+    if w.dtype == jnp.bfloat16:
+        return jnp.einsum("th,oh->to", x_bf, w, preferred_element_type=jnp.float32)
+    w32 = w.astype(jnp.float32)
+    hi = jax.lax.reduce_precision(w32, 8, 7)
+    rem = w32 - hi
+    mid = jax.lax.reduce_precision(rem, 8, 7)
+    lo = jax.lax.reduce_precision(rem - mid, 8, 7)
+    out = None
+    for chunk in (hi, mid, lo):
+        part = jnp.einsum(
+            "th,oh->to", x_bf, chunk.astype(jnp.bfloat16), preferred_element_type=jnp.float32
+        )
+        out = part if out is None else out + part
+    return out
 
 
 def pool_normalize_rope(
